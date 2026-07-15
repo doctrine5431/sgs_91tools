@@ -21,6 +21,7 @@ function listUserscriptFiles(relativeDirectory) {
 
 function readModule(relativePath) {
   const source = fs.readFileSync(path.join(root, relativePath), 'utf8')
+    .replace(/\r\n?/g, '\n')
     .replace(/^\/\/ ==UserScript==[\s\S]*?^\/\/ ==\/UserScript==\s*/m, '')
     .replaceAll('__SGS91_VERSION__', version)
     .trim();

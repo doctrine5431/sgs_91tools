@@ -18,6 +18,7 @@ assert.ok(fs.existsSync(assetPath), 'Release 成品文件必须存在');
 
 const actualSha = crypto.createHash('sha256').update(fs.readFileSync(assetPath)).digest('hex').toUpperCase();
 assert.equal(request.sha256, actualSha, '发布清单 SHA-256 必须与成品一致');
+assert.equal(fs.readFileSync(assetPath).includes(Buffer.from('\r\n')), false, 'Release 成品必须统一使用 LF 换行');
 
 assert.match(workflow, /paths:\s*[\s\S]*\.github\/release-request\.json/);
 assert.match(workflow, /permissions:\s*[\s\S]*contents:\s*write/);
@@ -27,4 +28,5 @@ assert.match(workflow, /gh release upload "\$TAG" "\$ASSET" --clobber/);
 assert.match(workflow, /GH_TOKEN:\s*\$\{\{ github\.token \}\}/);
 
 console.log('PASS 自动发布清单与版本、说明、成品及 SHA-256 一致');
+console.log('PASS Release 成品使用跨平台一致的 LF 换行');
 console.log('PASS GitHub Actions 包含标签验证、Release 创建和附件上传权限');
