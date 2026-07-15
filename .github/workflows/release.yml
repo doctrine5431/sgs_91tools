@@ -35,10 +35,12 @@ jobs:
           TITLE="$(node -p "require('./.github/release-request.json').title")"
           NOTES="$(node -p "require('./.github/release-request.json').notes")"
           ASSET="$(node -p "require('./.github/release-request.json').asset")"
-          EXPECTED_SHA="$(node -p "require('./.github/release-request.json').sha256.toUpperCase()")"
+          ASSET_LABEL="$(node -p "require('./.github/release-request.json').assetLabel")"
+          EXPECTED_SHA="$(node -p "require('./.github/release-request.json').sha256.toUpperCase())"
           PACKAGE_VERSION="$(node -p "require('./package.json').version")"
 
           test "$TAG" = "v$PACKAGE_VERSION"
+          test "$ASSET_LABEL" = "sgs91-assistant-$TAG.user.js"
           test -f "$NOTES"
           test -f "$ASSET"
           git ls-remote --exit-code --tags origin "refs/tags/$TAG"
@@ -50,6 +52,7 @@ jobs:
           echo "title=$TITLE" >> "$GITHUB_OUTPUT"
           echo "notes=$NOTES" >> "$GITHUB_OUTPUT"
           echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+          echo "asset_label=$ASSET_LABEL" >> "$GITHUB_OUTPUT"
 
       - name: Create or update GitHub Release
         env:
@@ -58,6 +61,7 @@ jobs:
           TITLE: ${{ steps.request.outputs.title }}
           NOTES: ${{ steps.request.outputs.notes }}
           ASSET: ${{ steps.request.outputs.asset }}
+          ASSET_LABEL: ${{ steps.request.outputs.asset_label }}
         shell: bash
         run: |
           set -euo pipefail
@@ -68,4 +72,4 @@ jobs:
             gh release create "$TAG" --verify-tag --title "$TITLE" --notes-file "$NOTES"
           fi
 
-          gh release upload "$TAG" "$ASSET" --clobber
+          gh release upload "$TAG" "$ASSET#$ASSET_LABEL" --clobber

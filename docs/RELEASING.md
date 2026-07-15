@@ -22,7 +22,7 @@
 5. 展示上传预览并等待确认。
 6. 更新 `.github/release-request.json`，确保标签、标题、说明、成品路径和 SHA-256 与预览一致。
 7. 确认后提交并创建版本标签；先推送标签，再推送 `main`。
-8. `main` 中的发布清单变化会触发 GitHub Actions，自动创建或更新 Release，并上传 `dist/sgs91-assistant.user.js`。
+8. `main` 中的发布清单变化会触发 GitHub Actions，自动创建或更新 Release；附件底层保持稳定名称 `sgs91-assistant.user.js`，在 Release 页面以带版本号的名称显示。
 
 ## GitHub Actions 自动发布
 
@@ -34,5 +34,6 @@
 - Release 说明和成品 JS 文件存在。
 - GitHub 上已经存在对应版本标签。
 - 成品 JS 的 SHA-256 与发布清单完全一致。
+- Release 附件显示名称符合 `sgs91-assistant-v版本号.user.js`，同时保持稳定下载地址供油猴自动更新。
 
 任一检查失败时不会创建或更新 Release。

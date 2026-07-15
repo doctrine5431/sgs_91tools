@@ -3,5 +3,6 @@
   "title": "三国杀91助手 v0.3.0",
   "notes": "release-notes/v0.3.0.md",
   "asset": "dist/sgs91-assistant.user.js",
+  "assetLabel": "sgs91-assistant-v0.3.0.user.js",
   "sha256": "BB3649F694D98AB4E98739CAE131D2CBFDCC5EE7F829A89A93F8DD83CA032422"
 }
