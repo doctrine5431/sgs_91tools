@@ -20,5 +20,19 @@
 3. 执行 `powershell -ExecutionPolicy Bypass -File .\scripts\verify.ps1`。
 4. 确认 `dist/sgs91-assistant.user.js` 与中文成品内容一致。
 5. 展示上传预览并等待确认。
-6. 确认后提交、推送、创建版本标签和 GitHub Release。
-7. 将 `dist/sgs91-assistant.user.js` 作为 Release 附件上传。
+6. 更新 `.github/release-request.json`，确保标签、标题、说明、成品路径和 SHA-256 与预览一致。
+7. 确认后提交并创建版本标签；先推送标签，再推送 `main`。
+8. `main` 中的发布清单变化会触发 GitHub Actions，自动创建或更新 Release，并上传 `dist/sgs91-assistant.user.js`。
+
+## GitHub Actions 自动发布
+
+工作流位于 `.github/workflows/release.yml`，不需要在本机安装 GitHub CLI。GitHub 的运行环境会使用仓库自带的临时权限执行发布。
+
+自动发布前会检查：
+
+- 发布清单标签与 `package.json` 版本一致。
+- Release 说明和成品 JS 文件存在。
+- GitHub 上已经存在对应版本标签。
+- 成品 JS 的 SHA-256 与发布清单完全一致。
+
+任一检查失败时不会创建或更新 Release。

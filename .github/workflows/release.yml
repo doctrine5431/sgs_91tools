@@ -1,0 +1,71 @@
+name: Publish GitHub Release
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/release-request.json
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish-release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Verify and publish release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Read and verify release request
+        id: request
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          TAG="$(node -p "require('./.github/release-request.json').tag")"
+          TITLE="$(node -p "require('./.github/release-request.json').title")"
+          NOTES="$(node -p "require('./.github/release-request.json').notes")"
+          ASSET="$(node -p "require('./.github/release-request.json').asset")"
+          EXPECTED_SHA="$(node -p "require('./.github/release-request.json').sha256.toUpperCase()")"
+          PACKAGE_VERSION="$(node -p "require('./package.json').version")"
+
+          test "$TAG" = "v$PACKAGE_VERSION"
+          test -f "$NOTES"
+          test -f "$ASSET"
+          git ls-remote --exit-code --tags origin "refs/tags/$TAG"
+
+          ACTUAL_SHA="$(sha256sum "$ASSET" | cut -d ' ' -f 1 | tr '[:lower:]' '[:upper:]')"
+          test "$ACTUAL_SHA" = "$EXPECTED_SHA"
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "title=$TITLE" >> "$GITHUB_OUTPUT"
+          echo "notes=$NOTES" >> "$GITHUB_OUTPUT"
+          echo "asset=$ASSET" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.request.outputs.tag }}
+          TITLE: ${{ steps.request.outputs.title }}
+          NOTES: ${{ steps.request.outputs.notes }}
+          ASSET: ${{ steps.request.outputs.asset }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" --title "$TITLE" --notes-file "$NOTES"
+          else
+            gh release create "$TAG" --verify-tag --title "$TITLE" --notes-file "$NOTES"
+          fi
+
+          gh release upload "$TAG" "$ASSET" --clobber

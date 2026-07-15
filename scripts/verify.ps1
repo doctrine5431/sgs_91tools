@@ -31,6 +31,9 @@ try {
     & $node '.\tests\core-registry.test.cjs'
     if ($LASTEXITCODE -ne 0) { throw 'Core registry tests failed.' }
 
+    & $node '.\tests\release-workflow.test.cjs'
+    if ($LASTEXITCODE -ne 0) { throw 'Release workflow tests failed.' }
+
     & $node '.\tests\release.test.cjs'
     if ($LASTEXITCODE -ne 0) { throw 'Release tests failed.' }
 
