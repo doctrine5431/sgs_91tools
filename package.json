@@ -1,6 +1,6 @@
 {
   "name": "sgs91-assistant",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "description": "三国杀一将成名多武将只读对局助手",
   "scripts": {

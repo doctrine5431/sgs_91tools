@@ -29,11 +29,15 @@ function readModule(relativePath) {
 
 const header = `// ==UserScript==
 // @name         三国杀91助手
-// @namespace    https://z456.cc/sanguosha/91-assistant
+// @namespace    https://github.com/doctrine5431
 // @version      ${version}
 // @description  多武将只读对局助手：首版支持谋邓艾骤袭提示和手牌花色排序，不自动出牌、不上传数据。
 // @author       FAWEI
 // @license      MIT
+// @homepageURL  https://github.com/doctrine5431/sgs_91tools
+// @supportURL   https://github.com/doctrine5431/sgs_91tools/issues
+// @updateURL    https://github.com/doctrine5431/sgs_91tools/releases/latest/download/sgs91-assistant.user.js
+// @downloadURL  https://github.com/doctrine5431/sgs_91tools/releases/latest/download/sgs91-assistant.user.js
 // @match        https://web.sanguosha.com/*
 // @match        https://*.sanguosha.com/*
 // @grant        none
@@ -48,7 +52,10 @@ const sourceFiles = [
 if (!sourceFiles.length) throw new Error('No userscript modules found.');
 
 const output = `${header}\n\n${sourceFiles.map(readModule).join('\n\n')}\n`;
-const outputPath = path.join(root, 'dist', '三国杀91助手.user.js');
-fs.mkdirSync(path.dirname(outputPath), { recursive: true });
-fs.writeFileSync(outputPath, output, 'utf8');
-console.log(`Built ${path.relative(root, outputPath)} from ${sourceFiles.length} modules (${output.length} chars)`);
+const outputPaths = [
+  path.join(root, 'dist', '三国杀91助手.user.js'),
+  path.join(root, 'dist', 'sgs91-assistant.user.js'),
+];
+fs.mkdirSync(path.dirname(outputPaths[0]), { recursive: true });
+for (const outputPath of outputPaths) fs.writeFileSync(outputPath, output, 'utf8');
+console.log(`Built ${outputPaths.map((item) => path.relative(root, item)).join(', ')} from ${sourceFiles.length} modules (${output.length} chars each)`);

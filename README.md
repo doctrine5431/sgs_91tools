@@ -8,9 +8,11 @@
 
 安装前请确保浏览器已经安装 [Tampermonkey](https://www.tampermonkey.net/) 或 Violentmonkey。
 
-**[点击安装三国杀91助手](https://raw.githubusercontent.com/doctrine5431/sgs_91tools/main/dist/%E4%B8%89%E5%9B%BD%E6%9D%8091%E5%8A%A9%E6%89%8B.user.js)**
+**[点击安装三国杀91助手](https://github.com/doctrine5431/sgs_91tools/releases/latest/download/sgs91-assistant.user.js)**
 
 打开链接后，在油猴扩展的安装页面点击“安装”，然后刷新游戏网页即可。
+
+也可以进入 [Releases](https://github.com/doctrine5431/sgs_91tools/releases) 查看版本说明和下载历史版本。
 
 ## 支持的游戏页面
 

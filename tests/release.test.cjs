@@ -6,11 +6,18 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'dist', '三国杀91助手.user.js'), 'utf8');
+const releaseAsset = fs.readFileSync(path.join(__dirname, '..', 'dist', 'sgs91-assistant.user.js'), 'utf8');
 
 assert.equal((source.match(/\/\/ ==UserScript==/g) || []).length, 1, '合并脚本只能有一个元数据头');
 assert.equal((source.match(/\/\/ ==\/UserScript==/g) || []).length, 1, '合并脚本只能有一个元数据尾');
 assert.match(source, /@name\s+三国杀91助手/);
-assert.match(source, /@version\s+0\.2\.0/);
+assert.match(source, /@namespace\s+https:\/\/github\.com\/doctrine5431/);
+assert.match(source, /@version\s+0\.2\.1/);
+assert.match(source, /@homepageURL\s+https:\/\/github\.com\/doctrine5431\/sgs_91tools/);
+assert.match(source, /@supportURL\s+https:\/\/github\.com\/doctrine5431\/sgs_91tools\/issues/);
+assert.match(source, /@updateURL\s+https:\/\/github\.com\/doctrine5431\/sgs_91tools\/releases\/latest\/download\/sgs91-assistant\.user\.js/);
+assert.match(source, /@downloadURL\s+https:\/\/github\.com\/doctrine5431\/sgs_91tools\/releases\/latest\/download\/sgs91-assistant\.user\.js/);
+assert.equal(releaseAsset, source, 'Release 附件必须与中文成品脚本完全一致');
 assert.match(source, /characterIds:\s*\{\s*mouDengAi:\s*1740,/);
 assert.match(source, /skillIds:\s*\{\s*juxi:\s*3716,/);
 assert.match(source, /window\.MouDengAiJuxiHelper\s*=/);
@@ -51,7 +58,7 @@ window.location = context.location;
 window.navigator = context.navigator;
 
 vm.runInNewContext(source, context, { filename: 'sgs91-assistant.user.js' });
-assert.equal(window.SGS91Assistant.version, '0.2.0');
+assert.equal(window.SGS91Assistant.version, '0.2.1');
 assert.equal(window.SGS91Assistant.getModule('hero.mou-deng-ai.juxi').api, window.MouDengAiJuxiHelper);
 assert.equal(window.SGS91Assistant.getModule('feature.hand-suit-sorter').api, window.SGS91CardSorter);
 assert.equal(window.SGS91Assistant.listModules().length, 2);
@@ -63,3 +70,4 @@ console.log('PASS 发布脚本包含谋邓艾骤袭与花色排序');
 console.log('PASS 发布脚本保持只读、无远程代码和无上传请求');
 console.log('PASS 合并脚本可加载并注册两个功能模块');
 console.log('PASS 核心可查询武将、功能和共享游戏场景服务');
+console.log('PASS GitHub 地址、自动更新地址和 Release 附件一致');
