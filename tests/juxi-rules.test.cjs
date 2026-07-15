@@ -95,7 +95,7 @@ test('残局距离跳过阵亡座位，两张杀都不计入 X', () => {
   assert.equal(result.judgedCards.every((card) => card.countsAsUnavailable === false), true);
 });
 
-test('杀已用完时计入不可对敌', () => {
+test('普通杀次数已用完时，手牌中的杀不可对敌并计入 X', () => {
   const result = evaluateJuxi([
     { name: '杀' },
     { name: '闪' },
@@ -103,9 +103,10 @@ test('杀已用完时计入不可对敌', () => {
   ], baseContext({ slashUsedThisTurn: 1 }));
   assert.equal(result.unavailableCount, 3);
   assert.equal(result.judgedCards[0].countsAsUnavailable, true);
+  assert.equal(result.judgedCards[0].reason, '本回合普通【杀】使用次数已用完');
 });
 
-test('剩余杀次数为 0 时，多张杀都计入不可对敌', () => {
+test('普通杀次数用完后，手牌中多张杀都计入 X', () => {
   const result = evaluateJuxi([
     { name: '杀' },
     { name: '杀' },
@@ -115,14 +116,52 @@ test('剩余杀次数为 0 时，多张杀都计入不可对敌', () => {
   assert.equal(result.judgedCards[1].countsAsUnavailable, true);
 });
 
-test('杀上限为 0 时，所有杀都计入不可对敌', () => {
+test('普通杀上限为 0 时，所有种类的杀都计入 X', () => {
   const result = evaluateJuxi([
     { name: '杀' },
     { name: '雷杀' },
     { name: '火杀' },
   ], baseContext({ slashUsedThisTurn: 0, slashLimit: 0 }));
   assert.equal(result.unavailableCount, 3);
-  assert.equal(result.judgedCards.every((card) => card.countsAsUnavailable), true);
+  assert.equal(result.judgedCards.every((card) => card.countsAsUnavailable === true), true);
+});
+
+test('装备区的诸葛连弩生效时，普通杀次数用完仍可继续出杀', () => {
+  const result = evaluateJuxi([
+    { name: '杀' },
+    { name: '雷杀' },
+  ], baseContext({
+    slashUsedThisTurn: 1,
+    slashLimit: 1,
+    hasZhugeCrossbowEquipped: true,
+  }));
+  assert.equal(result.unavailableCount, 0);
+  assert.equal(result.judgedCards.every((card) => card.countsAsUnavailable === false), true);
+  assert.equal(result.judgedCards[0].reason, '已装备【诸葛连弩】，且范围内有目标');
+});
+
+test('优先采用游戏直接给出的剩余出杀次数', () => {
+  const result = evaluateJuxi([
+    { name: '杀' },
+  ], baseContext({
+    slashUsedThisTurn: 0,
+    slashLimit: 1,
+    slashRemainingThisTurn: 0,
+  }));
+  assert.equal(result.unavailableCount, 1);
+  assert.equal(result.judgedCards[0].countsAsUnavailable, true);
+});
+
+test('游戏没有提供杀上限时默认每回合可出一张杀', () => {
+  const result = evaluateJuxi([
+    { name: '杀' },
+  ], baseContext({
+    slashUsedThisTurn: 0,
+    slashLimit: null,
+    slashRemainingThisTurn: null,
+  }));
+  assert.equal(result.unavailableCount, 0);
+  assert.equal(result.judgedCards[0].countsAsUnavailable, false);
 });
 
 test('剩余杀次数还有时，多张杀都按可对敌处理', () => {

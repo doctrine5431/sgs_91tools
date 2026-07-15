@@ -39,4 +39,6 @@ app.registerModule({
 
 `gameScene` 服务提供 `findInScene()`、`getGameScene()`、`getSelfSeatUi()` 和 `getCardContainer()`。
 
+`gameMessages` 服务提供 `subscribe()`、`publish()` 和 `probe()`，是武将模块的主要消息来源。`seatOverlay` 服务提供 `show()`、`clear()` 和座位对象读取能力。新模块应优先使用这两个内置服务，不能把 `__JND` 或其他油猴脚本作为运行前提。
+
 通用读取逻辑应优先加入共享服务，避免每个武将复制一份。已经完成并验证的谋邓艾代码暂时保持模块内独立，后续只在有对应回归测试时再逐步抽取。

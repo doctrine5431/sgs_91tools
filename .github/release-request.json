@@ -1,7 +1,7 @@
 {
-  "tag": "v0.2.1",
-  "title": "三国杀91助手 v0.2.1",
-  "notes": "release-notes/v0.2.1.md",
+  "tag": "v0.3.0",
+  "title": "三国杀91助手 v0.3.0",
+  "notes": "release-notes/v0.3.0.md",
   "asset": "dist/sgs91-assistant.user.js",
-  "sha256": "F5210D1AD6C0E083C5F14EA03671C0F8E0880F3288BA8E5FE8EDA182631AA8BF"
+  "sha256": "BB3649F694D98AB4E98739CAE131D2CBFDCC5EE7F829A89A93F8DD83CA032422"
 }

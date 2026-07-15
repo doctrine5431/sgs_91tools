@@ -19,6 +19,8 @@
     seatStripKey: 'mou-deng-ai-juxi-x',
     invalidStripPrefix: 'mou-deng-ai-juxi-invalid-',
     renderIntervalMs: 16,
+    hintFontName: 'FZBW',
+    seatStripFontSize: 16,
     cardBadgeFontSize: 20,
     cardBadgeXRatio: 0.4,
     cardBadgeYRatio: 1,
@@ -74,6 +76,7 @@
     slashRemainingThisTurn: null,
     slashLimit: CONFIG.slashLimit,
     slashCounterSource: 'message-counter',
+    hasZhugeCrossbowEquipped: false,
     attackRange: CONFIG.defaultAttackRange,
     inGame: false,
     knownSeats: [],
@@ -104,6 +107,7 @@
       bootAt: new Date().toISOString(),
       jndSeen: false,
       jndHooked: false,
+      internalMessagesHooked: false,
       pageBridgeInjected: false,
       pageBridgeReady: false,
       lastMessageAt: '',
@@ -173,6 +177,18 @@
     });
   }
 
+  function getSlashRemainingUses(context) {
+    if (context.hasZhugeCrossbowEquipped === true) return Infinity;
+    if (context.slashRemainingThisTurn != null && Number.isFinite(Number(context.slashRemainingThisTurn))) {
+      return Math.max(0, Number(context.slashRemainingThisTurn));
+    }
+    const limit = context.slashLimit != null && context.slashLimit !== '' && Number.isFinite(Number(context.slashLimit))
+      ? Math.max(0, Number(context.slashLimit))
+      : 1;
+    const used = Number.isFinite(Number(context.slashUsedThisTurn)) ? Math.max(0, Number(context.slashUsedThisTurn)) : 0;
+    return Math.max(0, limit - used);
+  }
+
   function hasDistanceOneTarget(context) {
     return computeDistanceToOthers(context).some((seat) => {
       if (seat.targetKnown) return seat.targetable;
@@ -187,9 +203,6 @@
   function judgeCardTargetability(card, context) {
     const name = normalizeCardName(card && card.name);
     const phase = context.currentPhase || '';
-    const slashUsed = Number(context.slashUsedThisTurn || 0);
-    const rawSlashLimit = context.slashLimit == null ? CONFIG.slashLimit : Number(context.slashLimit);
-    const slashLimit = Number.isFinite(rawSlashLimit) ? Math.max(0, rawSlashLimit) : Infinity;
 
     if (!name) return { ...card, name, canTargetOther: null, countsAsUnavailable: false, reason: '未识别牌名，暂不计入', confidence: 'unknown' };
     if (isEquipment(card)) return { ...card, name, canTargetOther: false, countsAsUnavailable: true, reason: '装备牌通常只能用于自己，不能指定其他角色', confidence: 'high' };
@@ -197,10 +210,9 @@
 
     if (isSlashName(name)) {
       if (phase !== 'play') return { ...card, name, canTargetOther: false, countsAsUnavailable: true, reason: '当前不是出牌阶段，【杀】不能主动指定其他角色', confidence: 'medium' };
-      if (slashLimit <= 0) return { ...card, name, canTargetOther: false, countsAsUnavailable: true, reason: '本回合被限制为不能使用【杀】（0/0）', confidence: 'high' };
-      if (slashUsed >= slashLimit) return { ...card, name, canTargetOther: false, countsAsUnavailable: true, reason: `本回合【杀】次数已用完（${slashUsed}/${slashLimit}）`, confidence: 'medium' };
+      if (getSlashRemainingUses(context) <= 0) return { ...card, name, canTargetOther: false, countsAsUnavailable: true, reason: '本回合普通【杀】使用次数已用完', confidence: 'high' };
       if (!hasRangeTarget(context)) return { ...card, name, canTargetOther: false, countsAsUnavailable: true, reason: '当前攻击范围内没有可指定的其他角色', confidence: 'medium' };
-      return { ...card, name, canTargetOther: true, countsAsUnavailable: false, reason: '【杀】次数未用完且范围内有目标', confidence: 'medium' };
+      return { ...card, name, canTargetOther: true, countsAsUnavailable: false, reason: context.hasZhugeCrossbowEquipped === true ? '已装备【诸葛连弩】，且范围内有目标' : '本回合仍可使用普通【杀】，且范围内有目标', confidence: 'high' };
     }
 
     if (DISTANCE_ONE_TRICKS.has(name)) {
@@ -253,12 +265,12 @@
     let cur = target;
     for (const name of path) {
       if (!cur || typeof cur !== 'object') return null;
-      cur = cur instanceof Array
+      cur = Array.isArray(cur)
         ? (cur.length ? cur.flatMap((item) => getChildren(item, name)) : [])
         : getChildren(cur, name);
-      if (cur instanceof Array) cur = single(cur);
+      if (Array.isArray(cur)) cur = single(cur);
     }
-    return cur && (cur instanceof Array ? (cur.length ? single(cur) : null) : cur) || null;
+    return cur && (Array.isArray(cur) ? (cur.length ? single(cur) : null) : cur) || null;
   }
 
   function getCardContainer() {
@@ -771,6 +783,37 @@
     };
   }
 
+  function candidateHasCardName(candidate, expectedName) {
+    if (!candidate) return false;
+    return [candidate, candidate.theCard, candidate.card, candidate.cardData, candidate.data]
+      .filter(Boolean)
+      .some((item) => normalizeCardName(extractCardName(item)) === expectedName);
+  }
+
+  function readSeatHasEquippedCard(seat, expectedName) {
+    const seatObject = getSeatObject(seat);
+    const seatUi = seatObject && (seatObject.SeatUI || seatObject.seatUI);
+    const directCandidates = [
+      seatObject && seatObject.weapon,
+      seatObject && seatObject.Weapon,
+      seatObject && seatObject.weaponCard,
+      seatObject && seatObject.WeaponCard,
+      seatUi && seatUi.weapon,
+      seatUi && seatUi.weaponCard,
+    ].filter(Boolean);
+    if (directCandidates.some((item) => candidateHasCardName(item, expectedName))) return true;
+
+    const equipLists = [
+      seatObject && seatObject.equipCardUIs,
+      seatObject && seatObject.equipCards,
+      seatObject && seatObject.Equips,
+      seatObject && seatObject.equips,
+      seatUi && seatUi.equipCardUIs,
+      seatUi && seatUi.equipCards,
+    ].filter(Array.isArray);
+    return equipLists.some((list) => list.some((item) => candidateHasCardName(item, expectedName)));
+  }
+
   function readSeatHasWeapon(seat) {
     const seatObject = getSeatObject(seat);
     const seatUi = seatObject && (seatObject.SeatUI || seatObject.seatUI);
@@ -1105,9 +1148,27 @@
     ));
   }
 
+  function payloadHasJuxiSource(payload) {
+    if (!payload || typeof payload !== 'object') return false;
+    const juxiId = Number(CONFIG.skillIds.juxi);
+    return [
+      payload.sourceSpellId,
+      payload.sourceSkillId,
+      payload.reasonSpellId,
+      payload.reasonSkillId,
+      payload.parentSpellId,
+      payload.parentSkillId,
+      payload.fromSpellId,
+      payload.fromSkillId,
+      payload.triggerSpellId,
+      payload.triggerSkillId,
+    ].some((value) => toNumber(value, null) === juxiId);
+  }
+
   function payloadLooksLikeSlashUse(type, payload) {
     if (type !== 'MsgUseCard') return false;
     if (!payloadBelongsToSelf(payload)) return false;
+    if (payloadLooksLikeJuxiSkill(payload) || payloadHasJuxiSource(payload)) return false;
     if (isSlashName(payloadCardName(payload))) return true;
     const spellId = toNumber(payload && (payload.spellId ?? payload.SpellId), null);
     if (spellId !== 1) return false;
@@ -1245,6 +1306,10 @@
     if (!isRealSeat(seat)) return;
     delete state.pendingJuxiBySeat[seat];
     delete state.juxiInvalidMarks[seat];
+    try {
+      window.SGS91Assistant?.getService?.('seatOverlay')?.clear?.(`${CONFIG.invalidStripPrefix}${seat}`);
+    } catch {
+    }
     try {
       if (window.__JND && typeof window.__JND.clearSeatSkillStrip === 'function') {
         window.__JND.clearSeatSkillStrip(`${CONFIG.invalidStripPrefix}${seat}`);
@@ -1400,6 +1465,7 @@
     const managerTurnSeat = getCurrentTurnSeat();
     if (isRealSeat(managerTurnSeat)) state.currentTurnSeat = managerTurnSeat;
     state.attackRange = readAttackRange(state.selfSeat);
+    state.hasZhugeCrossbowEquipped = readSeatHasEquippedCard(state.selfSeat, '诸葛连弩');
     const slashCounter = readSelfSlashCounter(state.selfSeat);
     if (slashCounter) {
       state.slashRemainingThisTurn = slashCounter.remaining;
@@ -1428,7 +1494,9 @@
       selfSeat: state.selfSeat,
       attackRange: state.attackRange,
       slashUsedThisTurn: state.slashUsedThisTurn,
+      slashRemainingThisTurn: state.slashRemainingThisTurn,
       slashLimit: state.slashLimit,
+      hasZhugeCrossbowEquipped: state.hasZhugeCrossbowEquipped,
       seats: rows,
     });
     state.judgedCards = result.judgedCards;
@@ -1448,17 +1516,17 @@
       #${CONFIG.domSeatStripId} {
         position: fixed;
         z-index: 99998;
-        height: 22px;
-        min-width: 86px;
+        height: 24px;
+        min-width: 96px;
         padding: 0 6px;
         box-sizing: border-box;
         background: rgba(43, 43, 43, 0.94);
         border: 1px solid #d8b45f;
         color: #f4d17b;
-        font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
-        font-size: 13px;
+        font-family: "FZBW", sans-serif;
+        font-size: ${CONFIG.seatStripFontSize}px;
         font-weight: 700;
-        line-height: 20px;
+        line-height: 22px;
         text-align: center;
         pointer-events: none;
         text-shadow: 0 1px 2px #000;
@@ -1515,6 +1583,35 @@
     });
   }
 
+  function drawRoundRect(graphics, width, height, radius, fillStyle) {
+    if (!graphics) return false;
+    const safeWidth = Math.max(0, Number(width) || 0);
+    const safeHeight = Math.max(0, Number(height) || 0);
+    const safeRadius = Math.max(0, Math.min(Number(radius) || 0, Math.min(safeWidth, safeHeight) / 2));
+    if (!safeRadius || typeof graphics.drawPath !== 'function') {
+      graphics.drawRect?.(0, 0, safeWidth, safeHeight, fillStyle);
+      return true;
+    }
+    try {
+      graphics.drawPath(0, 0, [
+        ['moveTo', safeRadius, 0],
+        ['lineTo', safeWidth - safeRadius, 0],
+        ['arcTo', safeWidth, 0, safeWidth, safeRadius, safeRadius],
+        ['lineTo', safeWidth, safeHeight - safeRadius],
+        ['arcTo', safeWidth, safeHeight, safeWidth - safeRadius, safeHeight, safeRadius],
+        ['lineTo', safeRadius, safeHeight],
+        ['arcTo', 0, safeHeight, 0, safeHeight - safeRadius, safeRadius],
+        ['lineTo', 0, safeRadius],
+        ['arcTo', 0, 0, safeRadius, 0, safeRadius],
+        ['closePath'],
+      ], { fillStyle });
+      return true;
+    } catch {
+      graphics.drawRect?.(0, 0, safeWidth, safeHeight, fillStyle);
+      return true;
+    }
+  }
+
   function createLayaCardBadgeSprite(cardWidth = 72) {
     const Laya = window.Laya;
     if (!Laya || !Laya.Sprite || !Laya.Text) return null;
@@ -1530,14 +1627,10 @@
       badge.pos(5, 4);
       badge.alpha = 0.98;
       badge.mouseEnabled = false;
-      if (window.__JND && window.__JND._box && typeof window.__JND._box.drawRoundRect === 'function') {
-        window.__JND._box.drawRoundRect(badge.graphics, labelWidth, labelHeight, 4, 'rgba(43,33,25,0.9)');
-      } else {
-        badge.graphics.drawRect(0, 0, labelWidth, labelHeight, 'rgba(43,33,25,0.9)', '#ffcf66', 1);
-      }
+      drawRoundRect(badge.graphics, labelWidth, labelHeight, 4, 'rgba(43,33,25,0.9)');
       const label = new Laya.Text();
       label.text = '不可对敌';
-      label.font = 'FZBW';
+      label.font = CONFIG.hintFontName;
       label.fontSize = fontSize;
       label.bold = true;
       label.color = '#ffe28a';
@@ -1703,6 +1796,10 @@
 
   function clearSeatStrip() {
     try {
+      window.SGS91Assistant?.getService?.('seatOverlay')?.clear?.(CONFIG.seatStripKey);
+    } catch {
+    }
+    try {
       if (window.__JND && typeof window.__JND.clearSeatSkillStrip === 'function') {
         window.__JND.clearSeatSkillStrip(CONFIG.seatStripKey);
       }
@@ -1714,6 +1811,30 @@
     if (dom) dom.remove();
   }
 
+  function renderSharedSeatStrip(text) {
+    const selfSeat = state.selfSeat;
+    const overlay = window.SGS91Assistant?.getService?.('seatOverlay');
+    if (!overlay?.show || !isRealSeat(selfSeat)) return false;
+    try {
+      const ok = overlay.show(CONFIG.seatStripKey, selfSeat, text, {
+        font: CONFIG.hintFontName,
+        fontSize: CONFIG.seatStripFontSize,
+        minFontSize: 10,
+        fitText: true,
+        textPaddingX: 4,
+        color: state.canUseJuxi ? '#a9f0af' : '#f4d17b',
+        zOrder: 99999,
+      });
+      if (ok) {
+        clearLayaSeatStrip();
+        document.getElementById(CONFIG.domSeatStripId)?.remove();
+        return true;
+      }
+    } catch {
+    }
+    return false;
+  }
+
   function renderJndSeatStrip(text) {
     const selfSeat = state.selfSeat;
     const jnd = window.__JND;
@@ -1721,7 +1842,8 @@
     try {
       if (lastJndStripText && lastJndStripText !== text) jnd.clearSeatSkillStrip(CONFIG.seatStripKey);
       const ok = jnd.showSeatSkillStrip(CONFIG.seatStripKey, selfSeat, text, {
-        fontSize: 13,
+        font: CONFIG.hintFontName,
+        fontSize: CONFIG.seatStripFontSize,
         minFontSize: 10,
         fitText: true,
         textPaddingX: 4,
@@ -1748,8 +1870,8 @@
     if (!Laya || !Laya.Sprite || !Laya.Text || !Laya.Point || !avatar || !comboLayer || typeof comboLayer.globalToLocal !== 'function') return false;
     clearLayaSeatStrip();
     try {
-      const width = state.canUseJuxi ? 96 : 78;
-      const height = 22;
+      const width = state.canUseJuxi ? 108 : 88;
+      const height = 24;
       const center = avatar.localToGlobal(new Laya.Point((avatar.width || 0) / 2, (avatar.height || 0) / 2), true);
       const local = comboLayer.globalToLocal(new Laya.Point(center.x, center.y), true);
       const strip = new Laya.Sprite();
@@ -1761,8 +1883,8 @@
       strip.graphics.drawRect(0, 0, width, height, '#2b2b2b', state.canUseJuxi ? '#75b979' : '#d8b45f', 1);
       const label = new Laya.Text();
       label.text = text;
-      label.font = 'FZBW';
-      label.fontSize = 13;
+      label.font = CONFIG.hintFontName;
+      label.fontSize = CONFIG.seatStripFontSize;
       label.bold = true;
       label.color = state.canUseJuxi ? '#a9f0af' : '#f4d17b';
       label.align = 'center';
@@ -1804,6 +1926,7 @@
     }
     const xText = formatStripNumber(state.unavailableCount);
     const text = `骤袭 X＝${xText}${state.canUseJuxi ? ' 可用' : ''}`;
+    if (renderSharedSeatStrip(text)) return;
     if (renderJndSeatStrip(text)) return;
     if (renderLayaSeatStrip(text)) return;
     renderDomSeatStrip(text);
@@ -1811,12 +1934,28 @@
 
   function renderInvalidJuxiMarks() {
     const jnd = window.__JND;
+    const overlay = window.SGS91Assistant?.getService?.('seatOverlay');
     Object.keys(state.juxiInvalidMarks).forEach((key) => {
       const mark = state.juxiInvalidMarks[key];
       const seat = toNumber(key, null);
       if (!mark || !isRealSeat(seat)) {
         clearJuxiInvalid(seat);
         return;
+      }
+      if (overlay?.show) {
+        try {
+          overlay.show(`${CONFIG.invalidStripPrefix}${seat}`, seat, '骤袭已失效', {
+            font: CONFIG.hintFontName,
+            fontSize: CONFIG.seatStripFontSize,
+            minFontSize: 10,
+            fitText: true,
+            textPaddingX: 4,
+            color: '#ffb1a1',
+            zOrder: 99999,
+          });
+          return;
+        } catch {
+        }
       }
       if (!jnd || typeof jnd.showSeatSkillStrip !== 'function') return;
       try {
@@ -1916,6 +2055,7 @@
         slashRemainingThisTurn: state.slashRemainingThisTurn,
         slashLimit: state.slashLimit,
         slashCounterSource: state.slashCounterSource,
+        hasZhugeCrossbowEquipped: state.hasZhugeCrossbowEquipped,
         slashUsageBySeat: cloneDiagnostic(state.slashUsageBySeat),
         attackRange: state.attackRange,
         selfIsMouDengAi: state.selfIsMouDengAi,
@@ -1980,6 +2120,16 @@
     setTimeout(() => clearInterval(timer), 180000);
   }
 
+  function hookInternalMessageBus() {
+    const getService = window.SGS91Assistant?.getService;
+    if (typeof getService !== 'function') return false;
+    const messages = getService.call(window.SGS91Assistant, 'gameMessages');
+    if (!messages || typeof messages.subscribe !== 'function' || state.hookStatus.internalMessagesHooked) return false;
+    messages.subscribe((type, payload) => onMessage(type, payload || {}));
+    state.hookStatus.internalMessagesHooked = true;
+    return true;
+  }
+
   function injectPageBridge() {
     if (document.getElementById('mda-juxi-page-bridge')) return;
     const script = document.createElement('script');
@@ -2011,7 +2161,9 @@
           currentTurnSeat: state.currentTurnSeat,
           isOwnPlayPhase: state.isOwnPlayPhase,
           slashUsedThisTurn: state.slashUsedThisTurn,
+          slashRemainingThisTurn: state.slashRemainingThisTurn,
           slashLimit: state.slashLimit,
+          hasZhugeCrossbowEquipped: state.hasZhugeCrossbowEquipped,
           attackRange: state.attackRange,
           selfIsMouDengAi: state.selfIsMouDengAi,
           characterEvidence: state.characterEvidence,
@@ -2056,6 +2208,7 @@
       renderAll();
     },
     onMessage,
+    __test: Object.freeze({ drawRoundRect }),
   };
 
   window.SGS91Assistant.registerModule({
@@ -2071,6 +2224,7 @@
   });
 
   injectPageBridge();
+  hookInternalMessageBus();
   hookJndBus();
   bootWhenReady();
 })();

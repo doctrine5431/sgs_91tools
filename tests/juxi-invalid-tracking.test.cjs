@@ -57,6 +57,23 @@ vm.runInNewContext(source, context, { filename: 'sgs-mou-deng-ai-juxi-helper.use
 const helper = window.MouDengAiJuxiHelper;
 helper.state.bodyReady = true;
 
+assert.equal(helper.config.hintFontName, 'FZBW', '骤袭座位条和手牌标记必须共用 FZBW 字体');
+assert.equal(helper.config.seatStripFontSize, 16, 'DOM 备用座位条不能退回 13px 微软雅黑');
+assert.match(source, /font-family:\s*"FZBW"/, 'DOM 备用座位条必须显式使用 FZBW');
+assert.doesNotMatch(source, /font-family:\s*"Microsoft YaHei"/, '骤袭提示不得再使用与 Laya 标记不同的微软雅黑');
+assert.equal(typeof helper.__test?.drawRoundRect, 'function', '91 助手必须内置原锦囊袋同款圆角绘制，不能依赖其他脚本');
+{
+  const calls = [];
+  helper.__test.drawRoundRect({
+    drawPath(x, y, commands, style) { calls.push(['path', x, y, commands, style]); },
+    drawRect(...args) { calls.push(['rect', ...args]); },
+  }, 70, 28, 4, 'rgba(43,33,25,0.9)');
+  assert.equal(calls[0][0], 'path', '不可对敌标记必须使用圆角路径');
+  assert.equal(calls[0][4].fillStyle, 'rgba(43,33,25,0.9)');
+}
+assert.match(source, /drawRoundRect\(badge\.graphics, labelWidth, labelHeight, 4, 'rgba\(43,33,25,0\.9\)'\)/,
+  '不可对敌标记必须无条件使用内置圆角底，而不是黄色方框备用样式');
+
 helper.onMessage('MsgGameTurnNtf', { currentSeat: 1 });
 helper.onMessage('MsgUseSkill', {
   srcSeat: 1,

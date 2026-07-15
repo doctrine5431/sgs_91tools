@@ -32,7 +32,7 @@ const header = `// ==UserScript==
 // @name         三国杀91助手
 // @namespace    https://github.com/doctrine5431
 // @version      ${version}
-// @description  多武将只读对局助手：首版支持谋邓艾骤袭提示和手牌花色排序，不自动出牌、不上传数据。
+// @description  多武将只读对局助手：提供技能状态、目标与手牌提示，并支持手牌花色排序。
 // @author       FAWEI
 // @license      MIT
 // @homepageURL  https://github.com/doctrine5431/sgs_91tools
@@ -41,7 +41,11 @@ const header = `// ==UserScript==
 // @downloadURL  https://github.com/doctrine5431/sgs_91tools/releases/latest/download/sgs91-assistant.user.js
 // @match        https://web.sanguosha.com/*
 // @match        https://*.sanguosha.com/*
-// @grant        none
+// @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        unsafeWindow
 // @run-at       document-start
 // ==/UserScript==`;
 
@@ -52,7 +56,24 @@ const sourceFiles = [
 ];
 if (!sourceFiles.length) throw new Error('No userscript modules found.');
 
-const output = `${header}\n\n${sourceFiles.map(readModule).join('\n\n')}\n`;
+const moduleBody = sourceFiles.map(readModule).join('\n\n');
+const output = `${header}
+
+(function (sgs91PageWindow) {
+  'use strict';
+
+  // Tampermonkey/Violentmonkey 会把 GM 菜单 API 放在隔离环境中。
+  // 所有游戏读取与显示逻辑必须显式使用真实页面 window，才能访问 Laya 和游戏消息。
+  const window = sgs91PageWindow;
+  const document = sgs91PageWindow.document;
+  const location = sgs91PageWindow.location;
+  const navigator = sgs91PageWindow.navigator;
+  const console = sgs91PageWindow.console || globalThis.console;
+  const CustomEvent = sgs91PageWindow.CustomEvent || globalThis.CustomEvent;
+
+${moduleBody}
+})(typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window);
+`;
 const outputPaths = [
   path.join(root, 'dist', '三国杀91助手.user.js'),
   path.join(root, 'dist', 'sgs91-assistant.user.js'),

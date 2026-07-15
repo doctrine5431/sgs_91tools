@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         三国杀91助手
 // @namespace    https://github.com/doctrine5431
-// @version      0.2.1
-// @description  多武将只读对局助手：首版支持谋邓艾骤袭提示和手牌花色排序，不自动出牌、不上传数据。
+// @version      0.3.0
+// @description  多武将只读对局助手：提供技能状态、目标与手牌提示，并支持手牌花色排序。
 // @author       FAWEI
 // @license      MIT
 // @homepageURL  https://github.com/doctrine5431/sgs_91tools
@@ -11,9 +11,25 @@
 // @downloadURL  https://github.com/doctrine5431/sgs_91tools/releases/latest/download/sgs91-assistant.user.js
 // @match        https://web.sanguosha.com/*
 // @match        https://*.sanguosha.com/*
-// @grant        none
+// @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @grant        unsafeWindow
 // @run-at       document-start
 // ==/UserScript==
+
+(function (sgs91PageWindow) {
+  'use strict';
+
+  // Tampermonkey/Violentmonkey 会把 GM 菜单 API 放在隔离环境中。
+  // 所有游戏读取与显示逻辑必须显式使用真实页面 window，才能访问 Laya 和游戏消息。
+  const window = sgs91PageWindow;
+  const document = sgs91PageWindow.document;
+  const location = sgs91PageWindow.location;
+  const navigator = sgs91PageWindow.navigator;
+  const console = sgs91PageWindow.console || globalThis.console;
+  const CustomEvent = sgs91PageWindow.CustomEvent || globalThis.CustomEvent;
 
 // ---- src/core/00-registry.user.js ----
 (function () {
@@ -107,7 +123,7 @@
 
   window.SGS91Assistant = Object.freeze({
     name: '三国杀91助手',
-    version: '0.2.1',
+    version: '0.3.0',
     registerModule,
     getModule,
     listModules,
@@ -192,6 +208,2782 @@
   }));
 })();
 
+// ---- src/core/20-game-message-bus.user.js ----
+(function () {
+  'use strict';
+
+  const app = window.SGS91Assistant;
+  if (!app) throw new Error('SGS91 core must load before game-message service.');
+  if (app.getService('gameMessages')) return;
+
+  const subscribers = new Set();
+  const recentSignatures = new Map();
+  const state = {
+    startedAt: new Date().toISOString(),
+    messageCount: 0,
+    lastMessageAt: '',
+    lastMessageType: '',
+    lastSource: '',
+    consoleHooked: false,
+    sgsModuleAccessorHooked: false,
+    sgsModuleHooked: false,
+    optionalJndHooked: false,
+  };
+
+  function normalizeMessageType(type, payload) {
+    const text = typeof type === 'string' ? type : '';
+    const constructorName = payload?.__ctor || payload?.constructor?.name || '';
+    if (constructorName && constructorName !== 'Object' && (!text || /^(logicmsg|cmsg|object)$/i.test(text))) {
+      return constructorName;
+    }
+    const namespaced = text.match(/(?:^|\.)(Msg[A-Za-z0-9]+|[A-Z][A-Za-z0-9]*(?:Ntf|Notify|Motify))$/);
+    return namespaced ? namespaced[1] : text;
+  }
+
+  function getMessageTypeFromArgs(args) {
+    for (const arg of args) {
+      if (arg && typeof arg === 'object') {
+        const type = arg.type || arg.rawType || arg.msgName || arg.name || arg.__ctor || arg.constructor?.name;
+        if (typeof type === 'string' && (/^(Msg|Notify|Ntf|C[A-Z])/.test(type) || /(Ntf|Notify|Motify)$/.test(type))) {
+          return type;
+        }
+      }
+      if (typeof arg === 'string') {
+        const match = arg.match(/\b(Msg[A-Za-z0-9]+|[A-Z][A-Za-z0-9]*(?:Ntf|Notify|Motify))\b/);
+        if (match) return match[1];
+      }
+    }
+    return '';
+  }
+
+  function getPayloadFromArgs(args) {
+    for (const arg of args) {
+      if (!arg || typeof arg !== 'object') continue;
+      if (arg.payload && typeof arg.payload === 'object') return arg.payload;
+      if (arg.data && typeof arg.data === 'object' && !Array.isArray(arg.data)) return arg.data;
+      return arg;
+    }
+    return {};
+  }
+
+  function messageSignature(type, payload) {
+    return JSON.stringify({
+      type,
+      seat: payload?.seat ?? null,
+      srcSeat: payload?.srcSeat ?? null,
+      ownerSeat: payload?.ownerSeat ?? null,
+      currentSeat: payload?.currentSeat ?? null,
+      phase: payload?.phase ?? null,
+      spellId: payload?.spellId ?? payload?.skillId ?? null,
+      id: payload?.id ?? null,
+      targets: Array.isArray(payload?.targets) ? payload.targets.slice(0, 8) : null,
+      data: Array.isArray(payload?.data) ? payload.data.slice(0, 8) : null,
+      spellIds: Array.isArray(payload?.spellIds) ? payload.spellIds.slice(0, 20) : null,
+    });
+  }
+
+  function publish(source, type, payload = {}, meta = {}) {
+    const normalizedType = normalizeMessageType(type, payload);
+    if (!normalizedType) return false;
+    const signature = messageSignature(normalizedType, payload);
+    const now = Date.now();
+    const previousAt = recentSignatures.get(signature) || 0;
+    if (now - previousAt < 80) return false;
+    recentSignatures.set(signature, now);
+    if (recentSignatures.size > 120) {
+      for (const [key, at] of recentSignatures) {
+        if (now - at > 3000) recentSignatures.delete(key);
+      }
+    }
+    state.messageCount += 1;
+    state.lastMessageAt = new Date().toISOString();
+    state.lastMessageType = normalizedType;
+    state.lastSource = String(source || 'unknown');
+    for (const listener of Array.from(subscribers)) {
+      try { listener(normalizedType, payload || {}, { source: state.lastSource, ...meta }); }
+      catch (error) { console.error('[三国杀91助手] 游戏消息处理失败', error); }
+    }
+    app.emit('game:message', {
+      type: normalizedType,
+      payload: payload || {},
+      source: state.lastSource,
+      meta,
+    });
+    return true;
+  }
+
+  function subscribe(listener) {
+    if (typeof listener !== 'function') throw new TypeError('Game message listener must be a function.');
+    subscribers.add(listener);
+    return () => subscribers.delete(listener);
+  }
+
+  function extractMessage(args) {
+    return {
+      type: getMessageTypeFromArgs(args),
+      payload: getPayloadFromArgs(args),
+    };
+  }
+
+  function hookConsoleLog() {
+    let original;
+    try { original = console.log; } catch { return false; }
+    if (original?.__sgs91GameMessagesHooked) {
+      state.consoleHooked = true;
+      return true;
+    }
+    function hookedConsoleLog(...args) {
+      try {
+        const message = extractMessage(args);
+        if (message.type) publish('page-console', message.type, message.payload, { direction: 'in' });
+      } catch {
+      }
+      return original.apply(this, args);
+    }
+    try { Object.defineProperty(hookedConsoleLog, '__sgs91GameMessagesHooked', { value: true }); }
+    catch { hookedConsoleLog.__sgs91GameMessagesHooked = true; }
+    try {
+      Object.defineProperty(console, 'log', {
+        configurable: true,
+        get() { return hookedConsoleLog; },
+        set(value) {
+          if (typeof value === 'function' && value !== hookedConsoleLog) original = value;
+        },
+      });
+    } catch {
+      console.log = hookedConsoleLog;
+    }
+    state.consoleHooked = true;
+    return true;
+  }
+
+  let sgsModuleValue;
+
+  function attachSgsModule() {
+    const bus = sgsModuleValue !== undefined ? sgsModuleValue : window.SGSMODULE;
+    if (!Array.isArray(bus)) return false;
+    if (bus.__sgs91GameMessagesHooked) {
+      state.sgsModuleHooked = true;
+      return true;
+    }
+    bus.push(function (...args) {
+      const message = extractMessage(args);
+      if (message.type) publish('page-sgsmodule', message.type, message.payload, { direction: 'in' });
+    });
+    try { Object.defineProperty(bus, '__sgs91GameMessagesHooked', { value: true }); }
+    catch { bus.__sgs91GameMessagesHooked = true; }
+    state.sgsModuleHooked = true;
+    return true;
+  }
+
+  function hookSgsModule() {
+    try { sgsModuleValue = window.SGSMODULE; } catch { sgsModuleValue = undefined; }
+    const descriptor = Object.getOwnPropertyDescriptor(window, 'SGSMODULE');
+    if (!descriptor || descriptor.configurable) {
+      try {
+        Object.defineProperty(window, 'SGSMODULE', {
+          configurable: true,
+          get() { return sgsModuleValue; },
+          set(value) {
+            sgsModuleValue = value;
+            if (Array.isArray(value)) setTimeout(attachSgsModule, 0);
+          },
+        });
+        state.sgsModuleAccessorHooked = true;
+      } catch {
+      }
+    }
+    attachSgsModule();
+    return state.sgsModuleAccessorHooked || state.sgsModuleHooked;
+  }
+
+  function attachOptionalJnd() {
+    const jnd = window.__JND;
+    if (!jnd || typeof jnd.onMsg !== 'function') return false;
+    if (jnd.__sgs91CoreMessagesHooked) {
+      state.optionalJndHooked = true;
+      return true;
+    }
+    jnd.onMsg((type, payload) => publish('optional-jnd', type, payload || {}, { direction: 'in' }));
+    try { Object.defineProperty(jnd, '__sgs91CoreMessagesHooked', { value: true }); }
+    catch { jnd.__sgs91CoreMessagesHooked = true; }
+    state.optionalJndHooked = true;
+    return true;
+  }
+
+  function probe() {
+    return {
+      ...state,
+      subscriberCount: subscribers.size,
+      hasSgsModule: Array.isArray(sgsModuleValue),
+      externalCompatibilityPresent: Boolean(window.__JND),
+    };
+  }
+
+  const api = Object.freeze({
+    subscribe,
+    publish,
+    probe,
+    normalizeMessageType,
+    extractMessage,
+  });
+  app.registerService('gameMessages', api);
+
+  hookConsoleLog();
+  hookSgsModule();
+  attachOptionalJnd();
+  const hookTimer = setInterval(() => {
+    attachSgsModule();
+    attachOptionalJnd();
+  }, 500);
+  setTimeout(() => clearInterval(hookTimer), 180000);
+})();
+
+// ---- src/core/25-notice-overlay.user.js ----
+(function () {
+  'use strict';
+
+  const app = window.SGS91Assistant;
+  if (!app) throw new Error('SGS91 core must load before notice-overlay service.');
+  if (app.getService('noticeOverlay')) return;
+
+  const rendered = new Map();
+  const STYLE = Object.freeze({
+    resourceKey: 'gameActionBg',
+    fallbackWidth: 640,
+    fallbackHeight: 50,
+    privateWidthFactor: 1.3,
+    publicWidthFactor: 1.1,
+    maxWidthFactor: 1.5,
+    privateAutoWidthPaddingRatio: 0.05,
+    publicAutoWidthPaddingRatio: 0.1,
+    gradientColor: '#0d0d0d',
+    gradientStripCount: 128,
+    gradientStops: Object.freeze([
+      Object.freeze({ pos: 0, alpha: 0 }),
+      Object.freeze({ pos: 0.16, alpha: 0.56 }),
+      Object.freeze({ pos: 0.84, alpha: 0.56 }),
+      Object.freeze({ pos: 1, alpha: 0 }),
+    ]),
+    noticeBaseY: 314,
+    groupOffsetY: -6,
+    privateOffsetY: 35,
+    privateDefaultDy: 200,
+    actionPromptGap: 36,
+    font: 'FZBW',
+    fontSize: 24,
+    fzbwOffsetY: 1.5,
+    textColor: '#f6de9c',
+    zOrder: 99999,
+  });
+  let feed = null;
+  let feedParent = null;
+
+  function findLayaObject(root, predicate, maxObjects = 5000) {
+    if (!root || typeof predicate !== 'function') return null;
+    const queue = [root];
+    const seen = new Set();
+    while (queue.length && seen.size < maxObjects) {
+      const object = queue.shift();
+      if (!object || typeof object !== 'object' || seen.has(object)) continue;
+      seen.add(object);
+      try { if (predicate(object)) return object; } catch {}
+      if (Array.isArray(object._children)) queue.push(...object._children);
+    }
+    return null;
+  }
+
+  function findSurface() {
+    const stage = window.Laya?.stage;
+    const scene = findLayaObject(stage, (object) => Boolean(
+      object?.gameActionTipContainer && typeof object.gameActionTipContainer.addChild === 'function'
+    ));
+    return scene ? { scene, layer: scene.gameActionTipContainer } : null;
+  }
+
+  function readNodeText(node) {
+    try {
+      return String(node?.text ?? node?._text ?? node?.htmlText ?? '').replace(/\s+/g, '');
+    } catch {
+      return '';
+    }
+  }
+
+  function isVisibleWithin(node, ancestor) {
+    let current = node;
+    while (current && current !== ancestor) {
+      if (current.visible === false || Number(current.alpha) === 0) return false;
+      current = current.parent;
+    }
+    return current === ancestor;
+  }
+
+  function nodeTopWithin(node, ancestor) {
+    try {
+      if (typeof node?.localToGlobal === 'function' && typeof ancestor?.globalToLocal === 'function') {
+        const Point = window.Laya?.Point;
+        const origin = Point ? new Point(0, 0) : { x: 0, y: 0 };
+        const globalPoint = node.localToGlobal(origin);
+        const localPoint = ancestor.globalToLocal(globalPoint);
+        if (Number.isFinite(Number(localPoint?.y))) return Number(localPoint.y);
+      }
+    } catch {}
+
+    let y = 0;
+    let current = node;
+    while (current && current !== ancestor) {
+      const scaleY = Number.isFinite(Number(current.scaleY)) ? Number(current.scaleY) : 1;
+      y = (Number(current.y) || 0) + y * scaleY;
+      current = current.parent;
+    }
+    return current === ancestor && Number.isFinite(y) ? y : null;
+  }
+
+  function findActionPromptY(layer) {
+    const candidates = [];
+    const queue = [...(layer?._children || [])];
+    const seen = new Set();
+    while (queue.length && seen.size < 2000) {
+      const node = queue.shift();
+      if (!node || typeof node !== 'object' || seen.has(node)) continue;
+      seen.add(node);
+      if (node.name === 'sgs91-notice-feed') continue;
+      const text = readNodeText(node);
+      if ((text.includes('请选择') && text.includes('卡牌'))
+        || (text.includes('出牌阶段') && text.includes('选择'))) {
+        const y = isVisibleWithin(node, layer) ? nodeTopWithin(node, layer) : null;
+        if (Number.isFinite(y)) candidates.push(y);
+      }
+      if (Array.isArray(node._children)) queue.push(...node._children);
+    }
+    return candidates.length ? Math.min(...candidates) : null;
+  }
+
+  function getBannerResource() {
+    try {
+      return window.RES?.GetRes?.(STYLE.resourceKey)
+        || window.Laya?.loader?.getRes?.(STYLE.resourceKey)
+        || window.Laya?.Loader?.getRes?.(STYLE.resourceKey)
+        || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function ensureFeed(layer) {
+    const Laya = window.Laya;
+    if (!layer || !Laya?.Sprite || typeof layer.addChild !== 'function') return null;
+    if (feed && feedParent === layer && feed.parent === layer) return feed;
+    try { feed?.removeSelf?.(); } catch {}
+    feed = new Laya.Sprite();
+    feed.name = 'sgs91-notice-feed';
+    feed.zOrder = STYLE.zOrder;
+    feed.mouseEnabled = false;
+    layer.addChild(feed);
+    feedParent = layer;
+    return feed;
+  }
+
+  function normalizeParts(options) {
+    if (Array.isArray(options?.parts) && options.parts.length) return options.parts.map((part) => ({
+      text: String(part?.text ?? ''),
+      font: part?.font || STYLE.font,
+      size: Number(part?.size) || STYLE.fontSize,
+      color: part?.color || STYLE.textColor,
+      offsetY: Number.isFinite(Number(part?.offsetY)) ? Number(part.offsetY) : STYLE.fzbwOffsetY,
+    }));
+    return [{
+      text: String(options?.text || ''),
+      font: STYLE.font,
+      size: STYLE.fontSize,
+      color: STYLE.textColor,
+      offsetY: STYLE.fzbwOffsetY,
+    }];
+  }
+
+  function createText(part) {
+    const label = new window.Laya.Text();
+    label.text = part.text;
+    label.font = part.font;
+    label.fontSize = part.size;
+    label.color = part.color;
+    label.valign = 'middle';
+    label.mouseEnabled = false;
+    return label;
+  }
+
+  function measuredWidth(label) {
+    const direct = Math.ceil(Number(label?.textWidth) || 0);
+    if (direct > 0) return direct;
+    return Math.ceil(Array.from(String(label?.text || '')).reduce((sum, character) => (
+      sum + (/^[\x00-\xff]$/.test(character) ? Number(label.fontSize) * 0.58 : Number(label.fontSize))
+    ), 0));
+  }
+
+  function gradientAlpha(position) {
+    const stops = STYLE.gradientStops;
+    if (position <= stops[0].pos) return stops[0].alpha;
+    for (let index = 1; index < stops.length; index += 1) {
+      const right = stops[index];
+      if (position > right.pos) continue;
+      const left = stops[index - 1];
+      let ratio = right.pos > left.pos ? (position - left.pos) / (right.pos - left.pos) : 0;
+      ratio = ratio * ratio * (3 - 2 * ratio);
+      return left.alpha + (right.alpha - left.alpha) * ratio;
+    }
+    return stops[stops.length - 1].alpha;
+  }
+
+  function drawGradient(row, width, height) {
+    const Sprite = window.Laya.Sprite;
+    for (let index = 0; index < STYLE.gradientStripCount; index += 1) {
+      const left = Math.round(index * width / STYLE.gradientStripCount);
+      const right = Math.round((index + 1) * width / STYLE.gradientStripCount);
+      if (right <= left) continue;
+      const strip = new Sprite();
+      strip.name = 'sgs91-notice-gradient-strip';
+      strip.size(right - left, height);
+      strip.pos(left, 0);
+      strip.graphics.drawRect(0, 0, right - left, height, STYLE.gradientColor);
+      strip.alpha = Math.max(0, Math.min(1, gradientAlpha((index + 0.5) / STYLE.gradientStripCount)));
+      strip.mouseEnabled = false;
+      row.addChild(strip);
+    }
+  }
+
+  function clear(key) {
+    const id = String(key || '');
+    const item = rendered.get(id);
+    try { item?.row?.removeSelf?.(); } catch {}
+    try { item?.row?.destroy?.(true); } catch {}
+    rendered.delete(id);
+    return true;
+  }
+
+  function show(key, options = {}) {
+    if (!key || !options?.text) return false;
+    const Laya = window.Laya;
+    const surface = findSurface();
+    if (!Laya?.Sprite || !Laya?.Text || !surface) return false;
+    clear(key);
+
+    const lane = options.lane === 'private' ? 'private' : 'public';
+    const resource = getBannerResource();
+    const baseWidth = Math.round(Number(resource?.width) || STYLE.fallbackWidth);
+    const height = Math.round(Number(resource?.height) || STYLE.fallbackHeight);
+    const parts = normalizeParts(options);
+    const labels = parts.map(createText);
+    const widths = labels.map(measuredWidth);
+    const textWidth = widths.reduce((sum, width) => sum + width, 0);
+    const widthFactor = lane === 'private' ? STYLE.privateWidthFactor : STYLE.publicWidthFactor;
+    const paddingRatio = lane === 'private'
+      ? STYLE.privateAutoWidthPaddingRatio : STYLE.publicAutoWidthPaddingRatio;
+    const width = Math.min(
+      Math.round(baseWidth * STYLE.maxWidthFactor),
+      Math.max(Math.round(baseWidth * widthFactor), Math.ceil(textWidth * (1 + paddingRatio * 2))),
+    );
+    const sceneWidth = Number(surface.scene?.width) || Number(Laya.stage?.width) || 1600;
+    const dx = Number(options.dx) || 0;
+    const dy = lane === 'private'
+      ? (Number.isFinite(Number(options.dy)) ? Number(options.dy) : STYLE.privateDefaultDy)
+      : (Number(options.dy) || 0);
+    const noticeBaseY = (Number.isFinite(Number(options.noticeBaseY))
+      ? Number(options.noticeBaseY)
+      : STYLE.noticeBaseY);
+    const normalBaseY = noticeBaseY + dy + (lane === 'private' ? STYLE.privateOffsetY : 0);
+    const promptY = options.anchor === 'before-action-prompt'
+      ? findActionPromptY(surface.layer)
+      : null;
+    const promptGap = Number.isFinite(Number(options.anchorGap))
+      ? Number(options.anchorGap)
+      : STYLE.actionPromptGap;
+    const baseY = Number.isFinite(promptY)
+      ? Math.round(promptY - height - promptGap)
+      : options.anchor === 'notice-base' ? noticeBaseY : normalBaseY;
+
+    const row = new Laya.Sprite();
+    row.name = `sgs91-notice-overlay-${String(key).replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+    row.zOrder = STYLE.zOrder;
+    row.mouseEnabled = false;
+    row.size(width, height);
+    row.pos(Math.round((sceneWidth - width) / 2) + dx, baseY);
+    drawGradient(row, width, height);
+
+    const content = new Laya.Sprite();
+    content.name = 'sgs91-notice-content';
+    content.size(width, height);
+    content.mouseEnabled = false;
+    let x = Math.round((width - textWidth) / 2);
+    labels.forEach((label, index) => {
+      label.pos(x, Math.round((height - label.fontSize) / 2) + parts[index].offsetY);
+      content.addChild(label);
+      x += widths[index];
+    });
+    row.addChild(content);
+    const parent = ensureFeed(surface.layer);
+    if (!parent) return false;
+    parent.addChild(row);
+    rendered.set(String(key), { row, lane, text: String(options.text), width, height });
+    return true;
+  }
+
+  app.registerService('noticeOverlay', Object.freeze({
+    show,
+    clear,
+    findSurface,
+    style: STYLE,
+    probe() {
+      return Array.from(rendered.entries()).map(([key, value]) => ({
+        key,
+        lane: value.lane,
+        text: value.text,
+        width: value.width,
+        height: value.height,
+        x: value.row?.x,
+        y: value.row?.y,
+      }));
+    },
+  }));
+})();
+
+// ---- src/core/30-seat-overlay.user.js ----
+(function () {
+  'use strict';
+
+  const app = window.SGS91Assistant;
+  if (!app) throw new Error('SGS91 core must load before seat-overlay service.');
+  if (app.getService('seatOverlay')) return;
+
+  const rendered = new Map();
+  const STRIP_STYLE = Object.freeze({
+    imageUrl: 'https://web.sanguosha.com/10/pc/res/assets/game/yjcmSeat.webp?v=ca8060a813',
+    frame: Object.freeze({ x: 972, y: 825, width: 175, height: 23 }),
+    x: 7,
+    y: 28,
+    textDy: 2,
+    font: 'FZBW',
+    fontSize: 16,
+    color: 'rgb(242, 217, 87)',
+  });
+  let stripTexture = null;
+  let textureLoadStarted = false;
+
+  function isRealSeat(value) {
+    const seat = Number(value);
+    return Number.isFinite(seat) && seat >= 0 && seat < 12;
+  }
+
+  function findLayaObject(root, predicate, maxObjects = 3200) {
+    if (!root || typeof predicate !== 'function') return null;
+    const queue = [root];
+    const seen = new Set();
+    while (queue.length && seen.size < maxObjects) {
+      const object = queue.shift();
+      if (!object || typeof object !== 'object' || seen.has(object)) continue;
+      seen.add(object);
+      try { if (predicate(object)) return object; } catch {}
+      if (Array.isArray(object._children)) queue.push(...object._children);
+    }
+    return null;
+  }
+
+  function findGameManager() {
+    const stage = window.Laya?.stage;
+    if (!stage) return null;
+    return findLayaObject(stage, (object) => {
+      if (object.gameManager?.Seats || object.gameManager?.seats) return true;
+      return Boolean((object.Seats || object.seats) && (
+        object.selfSeatIndex != null || object.SelfSeatIndex != null || object.selfSeat != null
+      ));
+    })?.gameManager || findLayaObject(stage, (object) => Boolean(
+      (object.Seats || object.seats) && (
+        object.selfSeatIndex != null || object.SelfSeatIndex != null || object.selfSeat != null
+      )
+    ));
+  }
+
+  function readSeatObject(manager, seat) {
+    const seats = manager?.Seats || manager?.seats;
+    if (!seats || !isRealSeat(seat)) return null;
+    try { return seats[seat] || seats.getNumberKey?.(Number(seat)) || null; }
+    catch { return null; }
+  }
+
+  function findSeatAvatar(seat) {
+    const object = readSeatObject(findGameManager(), seat);
+    const direct = object?.SeatUI?.seatAvatar || object?.seatUI?.seatAvatar
+      || object?.SeatUI?.avatar || object?.seatUI?.avatar
+      || object?.seatAvatar || object?.avatar;
+    if (direct && typeof direct.localToGlobal === 'function') return direct;
+    const stage = window.Laya?.stage;
+    return findLayaObject(stage, (candidate) => {
+      const candidateSeat = Number(candidate?.seat ?? candidate?.seatId ?? candidate?.SeatId ?? candidate?.userSeat);
+      const name = String(candidate?.name || candidate?.constructor?.name || '');
+      return candidateSeat === Number(seat)
+        && /avatar|seat/i.test(name)
+        && typeof candidate.localToGlobal === 'function';
+    }, 1800);
+  }
+
+  function findSeatLayer() {
+    const stage = window.Laya?.stage;
+    return findLayaObject(stage, (object) => {
+      const name = String(object?.name || object?.constructor?.name || '');
+      return /seatComboSprite|seatComboLayer|seatLayer/i.test(name)
+        && typeof object.globalToLocal === 'function'
+        && typeof object.addChild === 'function';
+    }, 1800) || stage;
+  }
+
+  function safeDomId(key) {
+    return `sgs91-seat-overlay-${String(key).replace(/[^a-zA-Z0-9_-]/g, '-')}`;
+  }
+
+  function textureSource(resource) {
+    return resource?.bitmap || resource?._bitmap || resource?.source || resource || null;
+  }
+
+  function getCachedResource() {
+    const Laya = window.Laya;
+    const plainUrl = STRIP_STYLE.imageUrl.split('?')[0];
+    for (const url of [STRIP_STYLE.imageUrl, plainUrl]) {
+      try {
+        const resource = Laya?.loader?.getRes?.(url) || Laya?.Loader?.getRes?.(url);
+        if (resource) return resource;
+      } catch {}
+    }
+    return null;
+  }
+
+  function createStripTexture() {
+    if (stripTexture) return stripTexture;
+    const Laya = window.Laya;
+    const source = textureSource(getCachedResource());
+    if (!source || !Laya?.Texture?.create) return null;
+    const frame = STRIP_STYLE.frame;
+    try {
+      stripTexture = Laya.Texture.create(
+        source,
+        frame.x,
+        frame.y,
+        frame.width,
+        frame.height,
+        0,
+        0,
+        frame.width,
+        frame.height,
+      ) || null;
+    } catch {
+      stripTexture = null;
+    }
+    return stripTexture;
+  }
+
+  function redrawAfterTextureLoad() {
+    stripTexture = null;
+    const rows = Array.from(rendered.entries()).map(([key, value]) => ({
+      key,
+      seat: value.seat,
+      text: value.text,
+      options: value.options || {},
+    }));
+    rows.forEach((row) => show(row.key, row.seat, row.text, row.options));
+  }
+
+  function preloadStripTexture() {
+    if (createStripTexture() || textureLoadStarted) return;
+    const Laya = window.Laya;
+    if (!Laya?.loader?.load) return;
+    textureLoadStarted = true;
+    try {
+      const complete = Laya.Handler?.create
+        ? Laya.Handler.create(null, redrawAfterTextureLoad)
+        : redrawAfterTextureLoad;
+      Laya.loader.load(STRIP_STYLE.imageUrl, complete, null, Laya.Loader?.IMAGE);
+    } catch {
+      textureLoadStarted = false;
+    }
+  }
+
+  function fittedFontSize(text, requested, options, width) {
+    let size = Math.max(10, Number(requested) || STRIP_STYLE.fontSize);
+    if (options.fitText !== true) return size;
+    const minimum = Math.max(8, Number(options.minFontSize) || 12);
+    const padding = Math.max(0, Number(options.textPaddingX) || 0);
+    const available = Math.max(1, width - padding * 2 - 2);
+    const estimatedUnits = Array.from(String(text)).reduce((sum, character) => (
+      sum + (/\s/.test(character) ? 0.35 : /[\x00-\xff]/.test(character) ? 0.62 : 1)
+    ), 0);
+    while (size > minimum && estimatedUnits * size > available) size -= 1;
+    return size;
+  }
+
+  function clear(key) {
+    const id = String(key);
+    const item = rendered.get(id);
+    if (item?.node) {
+      try { item.node.removeSelf?.(); } catch {}
+      try { item.node.remove?.(); } catch {}
+    }
+    document.getElementById(safeDomId(id))?.remove();
+    rendered.delete(id);
+    return true;
+  }
+
+  function renderLaya(key, seat, text, options) {
+    const Laya = window.Laya;
+    const avatar = findSeatAvatar(seat);
+    const layer = findSeatLayer();
+    if (!Laya?.Sprite || !Laya?.Text || !Laya?.Point || !avatar || !layer
+      || typeof avatar.localToGlobal !== 'function' || typeof layer.globalToLocal !== 'function'
+      || typeof layer.addChild !== 'function') return false;
+    try {
+      const texture = createStripTexture();
+      if (!texture) preloadStripTexture();
+      const width = Number(texture?.width) || STRIP_STYLE.frame.width;
+      const height = Number(texture?.height) || STRIP_STYLE.frame.height;
+      const fontSize = fittedFontSize(text, options.fontSize, options, width);
+      const center = avatar.localToGlobal(new Laya.Point(
+        (avatar.width || 0) / 2,
+        (avatar.height || 0) / 2,
+      ), true);
+      const local = layer.globalToLocal(new Laya.Point(center.x, center.y), true);
+      const strip = new Laya.Sprite();
+      strip.name = `sgs91-seat-overlay-${key}`;
+      strip.zOrder = Number(options.zOrder) || 99999;
+      strip.size(width, height);
+      strip.pos(
+        Math.round(local.x - width / 2 + (Number(options.x) || STRIP_STYLE.x)),
+        Math.round(local.y - height / 2 + (Number(options.y) || STRIP_STYLE.y)),
+      );
+      if (texture && typeof strip.graphics.drawTexture === 'function') {
+        strip.graphics.drawTexture(texture, 0, 0, width, height);
+      } else {
+        try { strip.graphics.drawRect(0, 0, width, height, options.background || '#2b2b2b', options.borderColor || '#a78649', 1); }
+        catch { strip.graphics.drawRect(0, 0, width, height, options.background || '#2b2b2b'); }
+      }
+      const label = new Laya.Text();
+      label.text = String(text);
+      label.font = options.font || STRIP_STYLE.font;
+      label.fontSize = fontSize;
+      label.bold = options.bold !== false;
+      label.color = options.color || STRIP_STYLE.color;
+      label.align = 'center';
+      label.valign = 'middle';
+      const padding = Math.max(0, Number(options.textPaddingX) || 0);
+      label.width = Math.max(1, width - padding * 2);
+      label.height = height;
+      label.pos?.(padding, Number(options.textDy) || STRIP_STYLE.textDy);
+      strip.addChild(label);
+      layer.addChild(strip);
+      rendered.set(String(key), {
+        mode: 'laya', node: strip, seat: Number(seat), text: String(text), options: { ...options },
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function avatarClientPoint(avatar) {
+    const Laya = window.Laya;
+    if (!Laya?.Point || !avatar || typeof avatar.localToGlobal !== 'function') return null;
+    try {
+      const point = avatar.localToGlobal(new Laya.Point(
+        (avatar.width || 0) / 2,
+        (avatar.height || 0) / 2,
+      ), true);
+      const canvas = Laya.stage?.canvas || Laya.stage?._canvas;
+      const rect = canvas?.getBoundingClientRect?.();
+      if (rect && Laya.stage?.width && Laya.stage?.height) {
+        return {
+          x: rect.left + point.x * rect.width / Laya.stage.width,
+          y: rect.top + point.y * rect.height / Laya.stage.height,
+        };
+      }
+      return { x: point.x, y: point.y };
+    } catch {
+      return null;
+    }
+  }
+
+  function renderDom(key, seat, text, options) {
+    if (!document.body) return false;
+    const point = avatarClientPoint(findSeatAvatar(seat));
+    if (!point) return false;
+    const element = document.createElement('div');
+    element.id = safeDomId(key);
+    element.textContent = String(text);
+    const width = STRIP_STYLE.frame.width;
+    const height = STRIP_STYLE.frame.height;
+    const fontSize = fittedFontSize(text, options.fontSize, options, width);
+    Object.assign(element.style, {
+      position: 'fixed',
+      left: `${Math.round(point.x - width / 2 + (Number(options.x) || STRIP_STYLE.x))}px`,
+      top: `${Math.round(point.y - height / 2 + (Number(options.y) || STRIP_STYLE.y))}px`,
+      zIndex: String(options.zOrder || 99999),
+      width: `${width}px`,
+      height: `${height}px`,
+      boxSizing: 'border-box',
+      padding: `${Number(options.textDy) || STRIP_STYLE.textDy}px ${Math.max(0, Number(options.textPaddingX) || 0)}px 0`,
+      border: '0',
+      borderRadius: '0',
+      background: options.background || 'rgba(43, 43, 43, .94)',
+      backgroundImage: `url("${STRIP_STYLE.imageUrl}")`,
+      backgroundPosition: `-${STRIP_STYLE.frame.x}px -${STRIP_STYLE.frame.y}px`,
+      backgroundRepeat: 'no-repeat',
+      color: options.color || STRIP_STYLE.color,
+      font: `${options.bold === false ? '400' : '700'} ${fontSize}px/${height}px ${options.font || STRIP_STYLE.font}, sans-serif`,
+      textAlign: 'center',
+      whiteSpace: 'nowrap',
+      pointerEvents: 'none',
+      overflow: 'hidden',
+    });
+    document.body.appendChild(element);
+    rendered.set(String(key), {
+      mode: 'dom', node: element, seat: Number(seat), text: String(text), options: { ...options },
+    });
+    return true;
+  }
+
+  function show(key, seat, text, options = {}) {
+    if (!key || !isRealSeat(seat) || !text) return false;
+    clear(key);
+    return renderLaya(String(key), Number(seat), String(text), options)
+      || renderDom(String(key), Number(seat), String(text), options);
+  }
+
+  function clearPrefix(prefix) {
+    for (const key of Array.from(rendered.keys())) {
+      if (key.startsWith(String(prefix))) clear(key);
+    }
+  }
+
+  app.registerService('seatOverlay', Object.freeze({
+    show,
+    clear,
+    clearPrefix,
+    findGameManager,
+    readSeatObject,
+    findSeatAvatar,
+    style: STRIP_STYLE,
+    probe() {
+      return Array.from(rendered.entries()).map(([key, value]) => ({
+        key,
+        mode: value.mode,
+        seat: value.seat,
+        text: value.text,
+      }));
+    },
+  }));
+})();
+
+// ---- src/heroes/hu-ban-chongyi.user.js ----
+(function () {
+  'use strict';
+
+  const app = window.SGS91Assistant;
+  if (!app) throw new Error('SGS91 core must load before Hu Ban Chongyi module.');
+  if (app.getModule('hero.hu-ban.chongyi')) return;
+
+  const CONFIG = Object.freeze({
+    version: '1.0.0',
+    characterId: 1122,
+    tipKey: 'hu-ban-chongyi-tip',
+    tipText: 'Tips：崇义：首张出【杀】',
+    font: 'FZBW',
+    skillColor: '#c7de2c',
+    outlineColor: '#3a281d',
+    refreshIntervalMs: 120,
+  });
+
+  function toNumber(value, fallback = null) {
+    if (value === '' || value == null) return fallback;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  }
+
+  function isRealSeat(value) {
+    const seat = toNumber(value, null);
+    return seat != null && seat >= 0 && seat < 12;
+  }
+
+  function normalizePhase(value) {
+    if (value === 4 || value === '4' || value === 'play' || value === '出牌阶段') return 'play';
+    return value == null ? '' : String(value);
+  }
+
+  function normalizeCardName(value) {
+    return String(value || '')
+      .replace(/[【】\[\]\s]/g, '')
+      .replace(/^普通/, '')
+      .trim();
+  }
+
+  function isSlashName(value) {
+    return /^(?:冰|火|雷)?杀$/.test(normalizeCardName(value));
+  }
+
+  function extractSeat(payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    return toNumber(
+      payload.currentSeat
+      ?? payload.turnSeat
+      ?? payload.seat
+      ?? payload.srcSeat
+      ?? payload.userSeat
+      ?? payload.ownerSeat
+      ?? payload.waitSeat,
+      null,
+    );
+  }
+
+  function extractCardName(cardOrUi) {
+    if (!cardOrUi) return '';
+    const card = cardOrUi.Card || cardOrUi.theCard || cardOrUi.card
+      || cardOrUi.cardData || cardOrUi.data || cardOrUi;
+    const direct = card.CardName || card.cardName || card.Name
+      || card.name || card.displayName || card.label;
+    if (typeof direct === 'string' && direct.trim()) return normalizeCardName(direct);
+    const constructorName = String(card.constructor?.name || '');
+    if (/^(?:Bing|Huo|Lei)?Sha(?:N)?Card$/i.test(constructorName)) {
+      if (/Bing/i.test(constructorName)) return '冰杀';
+      if (/Huo/i.test(constructorName)) return '火杀';
+      if (/Lei/i.test(constructorName)) return '雷杀';
+      return '杀';
+    }
+    return '';
+  }
+
+  function evaluatePrompt(input = {}) {
+    const enabled = input.enabled !== false;
+    const preview = input.preview === true;
+    const currentSeat = toNumber(input.currentSeat, null);
+    const alliedSeats = new Set((input.alliedSeats || []).map(Number).filter(Number.isFinite));
+    const huBanSeats = new Set((input.huBanSeats || []).map(Number).filter(Number.isFinite));
+    const cards = Array.isArray(input.currentCards) ? input.currentCards : [];
+    const slashIndexes = [];
+    cards.forEach((card, index) => {
+      const name = typeof card === 'string' ? card : card?.name;
+      if (isSlashName(name)) slashIndexes.push(index);
+    });
+
+    let reason = 'ready';
+    if (!enabled) reason = 'disabled';
+    else if (!preview && normalizePhase(input.phase) !== 'play') reason = 'not-play-phase';
+    else if (!preview && input.firstCardPending !== true) reason = 'first-card-already-used';
+    else if (!preview && !alliedSeats.has(currentSeat)) reason = 'current-seat-not-allied';
+    else if (!preview && !Array.from(huBanSeats).some((seat) => alliedSeats.has(seat))) {
+      reason = 'allied-huban-not-found';
+    } else if (!slashIndexes.length) reason = 'no-visible-slash';
+
+    const showTip = reason === 'ready';
+    const showRecommendations = reason === 'ready';
+    return Object.freeze({
+      show: showTip,
+      showTip,
+      showRecommendations,
+      reason,
+      slashIndexes: Object.freeze(slashIndexes),
+    });
+  }
+
+  function createLogicState(overrides = {}) {
+    return {
+      currentSeat: null,
+      phase: '',
+      firstCardPending: false,
+      generals: {},
+      ...overrides,
+    };
+  }
+
+  function reduceMessage(previous, rawType, payload = {}) {
+    const state = {
+      ...createLogicState(),
+      ...(previous || {}),
+      generals: { ...((previous && previous.generals) || {}) },
+    };
+    const type = String(rawType || '').split('.').pop();
+
+    if (/^(?:MsgDealCharacters|MsgGameStart|MsgStartGame|MsgGameOver|MsgGameEnd)$/.test(type)) {
+      state.currentSeat = null;
+      state.phase = '';
+      state.firstCardPending = false;
+      if (type !== 'MsgGameOver' && type !== 'MsgGameEnd') state.generals = {};
+    }
+
+    if (type === 'MsgGameSetCharacter' || type === 'MsgDealCharacters') {
+      const rows = Array.isArray(payload.characterInfo)
+        ? payload.characterInfo
+        : Array.isArray(payload.characters)
+          ? payload.characters
+          : [];
+      rows.forEach((row, index) => {
+        const seat = toNumber(row && (row.seat ?? row.seatId ?? row.SeatId), index);
+        const generalId = toNumber(row && (
+          row.characterId ?? row.generalId ?? row.GeneralId ?? row.CharacterId
+        ), null);
+        if (isRealSeat(seat) && generalId != null) state.generals[seat] = generalId;
+      });
+    }
+
+    if (type === 'MsgGameTurnNtf') {
+      state.currentSeat = extractSeat(payload);
+      state.phase = '';
+      state.firstCardPending = true;
+    }
+
+    if (type === 'MsgSetGamePhaseNtf') {
+      const seat = extractSeat(payload);
+      if (isRealSeat(seat)) state.currentSeat = seat;
+      state.phase = normalizePhase(payload.phase);
+      state.firstCardPending = state.phase === 'play';
+    }
+
+    if (type === 'MsgUseCard') {
+      const actor = extractSeat(payload);
+      if (state.phase === 'play' && actor != null && actor === state.currentSeat) {
+        state.firstCardPending = false;
+      }
+    }
+
+    return state;
+  }
+
+  function computeHandOverlayLayout(cardRects, slashIndexes) {
+    const rows = (Array.isArray(cardRects) ? cardRects : [])
+      .map((rect, index) => ({
+        index,
+        x: Number(rect?.x),
+        y: Number(rect?.y),
+        width: Math.max(1, Number(rect?.width) || 1),
+      }))
+      .filter((rect) => Number.isFinite(rect.x) && Number.isFinite(rect.y));
+    if (!rows.length) return [];
+    const slashSet = new Set((slashIndexes || []).map(Number));
+    return rows
+      .filter((rect) => slashSet.has(rect.index))
+      .map((rect) => ({
+        index: rect.index,
+        x: Math.round(rect.x + rect.width / 2 - 42),
+        y: Math.round(rect.y - 34),
+        width: 84,
+        height: 30,
+      }));
+  }
+
+  function isLiveObject(value) {
+    return Boolean(value && !value.destroyed && value._destroyed !== true);
+  }
+
+  function scanStage(predicate, limit = 6000) {
+    const stage = window.Laya?.stage;
+    if (!stage) return [];
+    const queue = [stage];
+    const seen = new Set();
+    const found = [];
+    let visited = 0;
+    while (queue.length && visited < limit) {
+      const item = queue.shift();
+      if (!item || seen.has(item)) continue;
+      seen.add(item);
+      visited += 1;
+      try {
+        if (predicate(item)) found.push(item);
+      } catch {
+      }
+      const children = Array.isArray(item._children) ? item._children : [];
+      children.forEach((child) => {
+        if (child && !seen.has(child)) queue.push(child);
+      });
+    }
+    return found;
+  }
+
+  function findGameManager() {
+    const fromService = app.getService('seatOverlay')?.findGameManager?.();
+    if (fromService) return fromService;
+    const direct = scanStage((object) => object?.gameManager
+      && (object.gameManager.Seats || object.gameManager.seats), 4500)[0];
+    if (direct?.gameManager) return direct.gameManager;
+    return scanStage((object) => object && (object.Seats || object.seats) && (
+      object.selfSeatIndex != null || object.SelfSeatIndex != null || object.selfSeat != null
+    ), 4500)[0] || null;
+  }
+
+  function getSeats(manager) {
+    return manager && (manager.Seats || manager.seats) || null;
+  }
+
+  function readSeatObject(seats, index) {
+    if (!seats || !isRealSeat(index)) return null;
+    try {
+      return seats[index] || seats.getNumberKey?.(index) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function seatIndexOf(object, manager) {
+    if (!object) return null;
+    for (const key of ['SeatId', 'seatId', 'SeatIndex', 'seatIndex', 'Index', 'index', 'seat']) {
+      const value = toNumber(object[key], null);
+      if (isRealSeat(value)) return value;
+    }
+    const seats = getSeats(manager);
+    for (let index = 0; index < 12; index += 1) {
+      if (readSeatObject(seats, index) === object) return index;
+    }
+    return null;
+  }
+
+  function getSelfSeat(manager) {
+    return toNumber(manager && (
+      manager.selfSeatIndex ?? manager.SelfSeatIndex ?? manager.selfSeat
+    ), null);
+  }
+
+  function getCurrentSeat(manager, state) {
+    const direct = toNumber(manager && (
+      manager.currentSeat ?? manager.CurrentSeat ?? manager.turnSeat ?? manager.TurnSeat
+      ?? manager.actionSeat ?? manager.ActionSeat ?? manager.waitSeat ?? manager.WaitSeat
+    ), null);
+    return direct != null ? direct : state.currentSeat;
+  }
+
+  function getGeneralId(seatObject) {
+    return toNumber(seatObject && (
+      seatObject.GeneralId ?? seatObject.generalId
+      ?? seatObject.CharacterId ?? seatObject.characterId
+    ), null);
+  }
+
+  function readTeamKey(seatObject) {
+    if (!seatObject) return '';
+    for (const key of [
+      'TeamId', 'teamId', 'Team', 'team', 'CampId', 'campId',
+      'Camp', 'camp', 'Side', 'side', 'GroupId', 'groupId',
+    ]) {
+      const value = seatObject[key];
+      if (value !== undefined && value !== null && String(value) !== '') {
+        return `${key.toLowerCase()}:${String(value)}`;
+      }
+    }
+    return '';
+  }
+
+  function detectTwoVersusTwo(manager, alliedSeats, state) {
+    const modeText = String(
+      manager?.modeName ?? manager?.ModeName ?? manager?.gameMode ?? manager?.GameMode
+      ?? manager?.constructor?.name ?? '',
+    );
+    if (/(?:2\s*(?:v|vs)\s*2|2V2)/i.test(modeText)) return true;
+    const occupiedSeats = new Set();
+    const seats = getSeats(manager);
+    for (let index = 0; index < 12; index += 1) {
+      if (readSeatObject(seats, index)) occupiedSeats.add(index);
+    }
+    Object.keys(state?.generals || {}).forEach((seat) => {
+      if (isRealSeat(seat)) occupiedSeats.add(Number(seat));
+    });
+    return occupiedSeats.size === 4 && alliedSeats.length === 2;
+  }
+
+  function readHandViews(manager) {
+    const candidates = scanStage((object) => object?.cardContainer
+      && Array.isArray(object.cardContainer.cardUis) && object.seat, 6500);
+    const bySeat = new Map();
+    candidates.forEach((view) => {
+      const seatObject = view.seat || view.cardContainer?.seat;
+      const seat = seatIndexOf(seatObject, manager);
+      if (!isRealSeat(seat)) return;
+      const cardUis = view.cardContainer.cardUis.filter(isLiveObject);
+      const cards = cardUis.map((ui, index) => ({ ui, index, name: extractCardName(ui) }));
+      const readable = cards.filter((card) => card.name).length;
+      const row = { seat, seatObject, view, cardContainer: view.cardContainer, cards, readable };
+      const old = bySeat.get(seat);
+      if (!old || readable > old.readable || (readable === old.readable && cards.length > old.cards.length)) {
+        bySeat.set(seat, row);
+      }
+    });
+    return Array.from(bySeat.values());
+  }
+
+  function collectAlliedSeats(manager, handViews) {
+    const allied = new Set();
+    const selfSeat = getSelfSeat(manager);
+    if (isRealSeat(selfSeat)) allied.add(selfSeat);
+    const seats = getSeats(manager);
+    if (isRealSeat(selfSeat)) {
+      const selfTeam = readTeamKey(readSeatObject(seats, selfSeat));
+      if (selfTeam) {
+        for (let index = 0; index < 12; index += 1) {
+          const seatObject = readSeatObject(seats, index);
+          if (seatObject && readTeamKey(seatObject) === selfTeam) allied.add(index);
+        }
+      }
+    }
+    handViews.forEach((row) => {
+      if (row.seat === selfSeat || row.readable > 0) allied.add(row.seat);
+    });
+    return Array.from(allied).sort((left, right) => left - right);
+  }
+
+  function collectHuBanSeats(manager, alliedSeats, state) {
+    const seats = getSeats(manager);
+    return alliedSeats.filter((seat) => {
+      const direct = getGeneralId(readSeatObject(seats, seat));
+      const cached = toNumber(state.generals[seat], null);
+      return direct === CONFIG.characterId || cached === CONFIG.characterId;
+    });
+  }
+
+  const runtime = {
+    enabled: true,
+    preview: false,
+    hookAttached: false,
+    hookFailure: '',
+    lastMessageAt: '',
+    lastMessageType: '',
+    lastRenderReason: 'waiting-for-game',
+    lastRenderSurface: { topTip: 'hidden', recommendations: 'hidden' },
+    lastSnapshot: null,
+    recentMessages: [],
+  };
+  let logic = createLogicState();
+  let messageUnsubscribe = null;
+  let refreshTimer = 0;
+  let layer = null;
+  let layerParent = null;
+  let lastLayerSignature = '';
+
+  function attachMessageBus() {
+    if (runtime.hookAttached) return true;
+    const messages = app.getService('gameMessages');
+    if (!messages || typeof messages.subscribe !== 'function') {
+      runtime.hookFailure = '三国杀91助手内置消息服务不可用';
+      return false;
+    }
+    try {
+      messageUnsubscribe = messages.subscribe((type, payload) => onMessage(type, payload || {}, 'internal'));
+      runtime.hookAttached = true;
+      runtime.hookFailure = '';
+      return true;
+    } catch (error) {
+      runtime.hookFailure = String(error?.message || error);
+      return false;
+    }
+  }
+
+  function ensureLayer(parent) {
+    const Laya = window.Laya;
+    if (!parent || !Laya?.Sprite || !Laya?.Text || typeof parent.addChild !== 'function') return null;
+    if (layer && layerParent === parent && isLiveObject(layer)) return layer;
+    if (layer?.destroy) {
+      try { layer.destroy(true); } catch {
+      }
+    }
+    layer = new Laya.Sprite();
+    layer.name = 'sgs91-hu-ban-chongyi-layer';
+    layer.zOrder = 999999;
+    layer.mouseEnabled = false;
+    parent.addChild(layer);
+    layerParent = parent;
+    lastLayerSignature = '';
+    return layer;
+  }
+
+  function addRecommendation(target, position) {
+    const label = new window.Laya.Text();
+    label.text = '推荐';
+    label.font = CONFIG.font;
+    label.fontSize = 24;
+    label.color = CONFIG.skillColor;
+    label.stroke = 2;
+    label.strokeColor = CONFIG.outlineColor;
+    label.align = 'center';
+    label.valign = 'middle';
+    label.width = position.width;
+    label.height = position.height;
+    label.pos(position.x, position.y);
+    label.mouseEnabled = false;
+    target.addChild(label);
+  }
+
+  function renderRecommendations(show, cards, slashCards) {
+    if (!window.Laya?.Sprite || !window.Laya?.Text) return false;
+    if (!show) {
+      layer?.removeChildren?.();
+      lastLayerSignature = '';
+      return true;
+    }
+    const visibleCards = (cards || []).filter((card) => card && isLiveObject(card.ui));
+    const parent = visibleCards[0]?.ui?.parent;
+    if (!parent) return false;
+    const sameParentCards = visibleCards.filter((card) => card.ui.parent === parent);
+    const slashUis = new Set((slashCards || []).map((card) => card?.ui));
+    const cardRects = sameParentCards.map((card) => ({
+      x: Number(card.ui.x) || 0,
+      y: Number(card.ui.y) || 0,
+      width: Math.max(1, (Number(card.ui.width) || 72) * (Number(card.ui.scaleX) || 1)),
+    }));
+    const slashIndexes = sameParentCards
+      .map((card, index) => slashUis.has(card.ui) ? index : -1)
+      .filter((index) => index >= 0);
+    const recommendations = computeHandOverlayLayout(cardRects, slashIndexes);
+    const target = ensureLayer(parent);
+    if (!target) return false;
+    const signature = JSON.stringify(recommendations);
+    if (signature === lastLayerSignature) return true;
+    lastLayerSignature = signature;
+    target.removeChildren?.();
+    recommendations.forEach((position) => addRecommendation(target, position));
+    return true;
+  }
+
+  function renderTopTip(show) {
+    const overlay = app.getService('noticeOverlay');
+    app.getService('seatOverlay')?.clear?.(CONFIG.tipKey);
+    if (!show) {
+      overlay?.clear?.(CONFIG.tipKey);
+      return true;
+    }
+    return overlay?.show?.(CONFIG.tipKey, {
+      lane: 'private',
+      anchor: 'before-action-prompt',
+      duration: 1000000,
+      text: CONFIG.tipText,
+      parts: [
+        { text: 'Tips：', font: CONFIG.font, size: 24, color: '#f6de9c' },
+        { text: '崇义：', font: CONFIG.font, size: 24, color: CONFIG.skillColor },
+        { text: '首张出', font: CONFIG.font, size: 24, color: '#f6de9c' },
+        { text: '【杀】', font: CONFIG.font, size: 24, color: '#E7B43C' },
+      ],
+    }) === true;
+  }
+
+  function buildSnapshot() {
+    const manager = findGameManager();
+    const handViews = readHandViews(manager);
+    const alliedSeats = collectAlliedSeats(manager, handViews);
+    const huBanSeats = collectHuBanSeats(manager, alliedSeats, logic);
+    const twoVersusTwo = detectTwoVersusTwo(manager, alliedSeats, logic);
+    const currentSeat = getCurrentSeat(manager, logic);
+    const currentView = handViews.find((row) => row.seat === currentSeat)
+      || (runtime.preview ? handViews.find((row) => row.cards.some((card) => isSlashName(card.name))) : null);
+    const currentCards = currentView?.cards || [];
+    const result = evaluatePrompt({
+      enabled: runtime.enabled,
+      preview: runtime.preview,
+      twoVersusTwo,
+      currentSeat: currentView ? currentView.seat : currentSeat,
+      alliedSeats,
+      huBanSeats,
+      phase: logic.phase,
+      firstCardPending: logic.firstCardPending,
+      currentCards,
+    });
+    const slashCards = result.slashIndexes.map((index) => currentCards[index]).filter(Boolean);
+    return {
+      managerFound: Boolean(manager),
+      selfSeat: getSelfSeat(manager),
+      currentSeat,
+      twoVersusTwo,
+      phase: logic.phase,
+      firstCardPending: logic.firstCardPending,
+      alliedSeats,
+      huBanSeats,
+      views: handViews.map((row) => ({
+        seat: row.seat,
+        generalId: getGeneralId(row.seatObject) ?? logic.generals[row.seat] ?? null,
+        cards: row.cards.map((card) => card.name || '?'),
+      })),
+      result,
+      currentCards,
+      slashCards,
+    };
+  }
+
+  function refresh() {
+    const snapshot = buildSnapshot();
+    runtime.lastSnapshot = {
+      ...snapshot,
+      currentCards: snapshot.currentCards.map((card) => ({ index: card.index, name: card.name })),
+      slashCards: snapshot.slashCards.map((card) => ({ index: card.index, name: card.name })),
+    };
+    runtime.lastRenderReason = snapshot.result.reason;
+    const tipRendered = renderTopTip(snapshot.result.showTip);
+    const cardsRendered = renderRecommendations(
+      snapshot.result.showRecommendations,
+      snapshot.currentCards,
+      snapshot.slashCards,
+    );
+    runtime.lastRenderSurface = {
+      topTip: tipRendered && snapshot.result.showTip ? '锦囊袋同款私有顶部提示' : 'hidden',
+      recommendations: cardsRendered && snapshot.result.showRecommendations ? 'Laya手牌层' : 'hidden',
+    };
+    return runtime.lastSnapshot;
+  }
+
+  function onMessage(type, payload = {}, source = 'manual') {
+    if (!type) return null;
+    logic = reduceMessage(logic, type, payload);
+    runtime.lastMessageAt = new Date().toISOString();
+    runtime.lastMessageType = String(type);
+    runtime.recentMessages.push({
+      at: runtime.lastMessageAt,
+      source,
+      type: String(type).split('.').pop(),
+      seat: extractSeat(payload),
+      phase: payload?.phase,
+      card: extractCardName(payload?.card || payload?.Card || payload),
+    });
+    if (runtime.recentMessages.length > 40) runtime.recentMessages.shift();
+    return refresh();
+  }
+
+  function cloneDiagnostic(value, depth = 0, seen = new Set()) {
+    if (depth > 4 || value == null) return value == null ? value : String(value);
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
+    if (typeof value !== 'object') return String(value);
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+    if (Array.isArray(value)) return value.slice(0, 40).map((item) => cloneDiagnostic(item, depth + 1, seen));
+    const output = {};
+    Object.keys(value).slice(0, 80).forEach((key) => {
+      try { output[key] = cloneDiagnostic(value[key], depth + 1, seen); }
+      catch { output[key] = '[Unreadable]'; }
+    });
+    return output;
+  }
+
+  function diagnostic() {
+    refresh();
+    return {
+      module: 'hero.hu-ban.chongyi',
+      version: CONFIG.version,
+      exportedAt: new Date().toISOString(),
+      config: { characterId: CONFIG.characterId, tipText: CONFIG.tipText },
+      runtime: cloneDiagnostic(runtime),
+      logic: cloneDiagnostic(logic),
+    };
+  }
+
+  async function copyDiagnostic() {
+    const text = JSON.stringify(diagnostic(), null, 2);
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return text;
+      } catch {
+      }
+    }
+    if (!document.body) return text;
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand?.('copy');
+    textarea.remove();
+    return text;
+  }
+
+  function destroy() {
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = 0;
+    if (typeof messageUnsubscribe === 'function') messageUnsubscribe();
+    messageUnsubscribe = null;
+    runtime.hookAttached = false;
+    renderTopTip(false);
+    layer?.removeChildren?.();
+    if (layer?.destroy) {
+      try { layer.destroy(true); } catch {
+      }
+    }
+    layer = null;
+    layerParent = null;
+    lastLayerSignature = '';
+  }
+
+  const api = Object.freeze({
+    version: CONFIG.version,
+    state: runtime,
+    refresh,
+    probe: diagnostic,
+    exportDiagnostic: diagnostic,
+    copyDiagnostic,
+    onMessage(type, payload) { return onMessage(type, payload || {}, 'manual'); },
+    setEnabled(value = true) {
+      runtime.enabled = Boolean(value);
+      return refresh();
+    },
+    setPreview(value = true) {
+      runtime.preview = Boolean(value);
+      lastLayerSignature = '';
+      return refresh();
+    },
+    destroy,
+    __test: Object.freeze({
+      normalizePhase,
+      normalizeCardName,
+      isSlashName,
+      extractSeat,
+      extractCardName,
+      evaluatePrompt,
+      createLogicState,
+      reduceMessage,
+      computeHandOverlayLayout,
+      readTeamKey,
+      detectTwoVersusTwo,
+    }),
+  });
+  window.HuBanChongyiHelper = api;
+
+  app.registerModule({
+    id: 'hero.hu-ban.chongyi',
+    type: 'hero',
+    name: '胡班·崇义',
+    version: CONFIG.version,
+    description: '2V2 我方有胡班时，在当前我方角色出牌阶段首张牌使用前提示优先出【杀】，并标记可见的【杀】。',
+    capabilities: ['game-message-read', 'hand-read', 'card-overlay', 'top-notice', 'diagnostic-export'],
+    characterIds: [CONFIG.characterId],
+    skillIds: [],
+    api,
+  });
+
+  attachMessageBus();
+  refreshTimer = setInterval(refresh, CONFIG.refreshIntervalMs);
+  setTimeout(refresh, 0);
+})();
+
+// ---- src/heroes/huan-jie-jianli.user.js ----
+(function () {
+  'use strict';
+
+  const app = window.SGS91Assistant;
+  if (!app) throw new Error('SGS91 core must load before Huan Jie Jianli module.');
+  if (app.getModule('hero.huan-jie.jianli')) return;
+
+  const CONFIG = {
+    version: '1.0.0',
+    characterId: 1098,
+    skillId: 3735,
+    characterNames: ['桓阶'],
+    skillNames: ['谏立'],
+    stripKeyPrefix: 'sgs91-huan-jie-jianli-',
+    dedupeMs: 250,
+    refreshIntervalMs: 300,
+  };
+  const RESET_MESSAGE = /(?:MsgDealCharacters|MsgGameStart|MsgStartGame|MsgGameOver|NotifyGameOver|MsgGameEnd|MsgLeaveGame|CRespLobbyTableLeave|CNotifyTableLeave|CRespTableLeave|CNotifyTableExit|CRespTableExit)$/i;
+  const FORBIDDEN_ACTIVATION_MESSAGE = /(?:MsgRoleOptTargetNtf$|Target|Choose|Select|Prompt|Candidate|Request|Req$|Ask|Preview)/i;
+  const CONFIRMED_ACTIVATION_MESSAGE = /(?:^MsgUseSpell$|(?:Use|Cast|Play).*(?:Skill|Spell)|(?:Skill|Spell).*(?:Effect|Result|Finish|Done|Success))/i;
+
+  function toNumber(value, fallback = null) {
+    if (value === '' || value == null) return fallback;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  }
+
+  function isRealSeat(value) {
+    const seat = toNumber(value, null);
+    return seat != null && seat >= 0 && seat < 12;
+  }
+
+  function normalizePhase(value) {
+    if (value === 4 || value === '4' || value === 'play' || value === '出牌阶段') return 'play';
+    return value == null ? '' : String(value);
+  }
+
+  function normalizeMessageType(type, payload) {
+    let text = typeof type === 'string' ? type.trim() : '';
+    const constructorName = payload && (payload.__ctor || payload.constructor?.name) || '';
+    if (constructorName && constructorName !== 'Object' && (!text || /^(?:logicmsg|cmsg|object)$/i.test(text))) {
+      text = constructorName;
+    }
+    if (text.includes('.')) text = text.split('.').pop();
+    if (/^%[a-z]$/i.test(text)) return '';
+    return text;
+  }
+
+  function payloadSkillId(payload) {
+    return toNumber(payload && (
+      payload.spellId ?? payload.skillId ?? payload.SpellId ?? payload.SkillId
+      ?? payload.spell?.id ?? payload.skill?.id
+    ), null);
+  }
+
+  function payloadSkillName(payload) {
+    return String(payload && (
+      payload.spellName ?? payload.skillName ?? payload.SpellName ?? payload.SkillName
+      ?? payload.spell?.name ?? payload.skill?.name
+    ) || '');
+  }
+
+  function payloadCharacterId(payload) {
+    return toNumber(payload && (
+      payload.ownerCharacterId ?? payload.characterId ?? payload.generalId
+      ?? payload.CharacterId ?? payload.GeneralId ?? payload.heroId
+    ), null);
+  }
+
+  function payloadCharacterName(payload) {
+    return String(payload && (
+      payload.ownerCharacterName ?? payload.characterName ?? payload.generalName
+      ?? payload.CharacterName ?? payload.GeneralName ?? payload.heroName
+    ) || '');
+  }
+
+  function payloadCasterSeat(payload) {
+    return toNumber(payload && (
+      payload.spellCasterSeat ?? payload.casterSeat ?? payload.srcSeat ?? payload.userSeat
+      ?? payload.ownerSeat ?? payload.optSeat ?? payload.fromSeat ?? payload.seat
+    ), null);
+  }
+
+  function extractSkillIds(value) {
+    if (!Array.isArray(value)) return [];
+    return value.map((item) => {
+      if (typeof item === 'number' || typeof item === 'string') return toNumber(item, null);
+      return payloadSkillId(item) ?? toNumber(item?.id, null);
+    }).filter((item) => item != null);
+  }
+
+  function includesAnyName(value, names) {
+    const text = String(value || '');
+    return names.some((name) => text.includes(name));
+  }
+
+  function createModel(overrides = {}) {
+    const model = {
+      selfSeat: null,
+      currentTurnSeat: null,
+      currentPhase: '',
+      turnToken: 0,
+      uses: 0,
+      selfIsHuanJie: false,
+      selfSkillIds: [],
+      discoveredSkillId: null,
+      skillNamesById: {},
+      seatStates: {},
+      lastTransition: '等待游戏消息',
+      lastResetReason: '',
+      ...overrides,
+      selfSkillIds: Array.isArray(overrides.selfSkillIds) ? overrides.selfSkillIds.slice() : [],
+      skillNamesById: { ...(overrides.skillNamesById || {}) },
+      seatStates: {},
+    };
+    Object.entries(overrides.seatStates || {}).forEach(([seat, state]) => {
+      if (!isRealSeat(seat)) return;
+      model.seatStates[seat] = {
+        isHuanJie: Boolean(state?.isHuanJie),
+        uses: Math.max(0, Math.min(2, toNumber(state?.uses, 0))),
+        turnToken: Math.max(0, toNumber(state?.turnToken, 0)),
+        lastResetTurnToken: toNumber(state?.lastResetTurnToken, null),
+        characterId: toNumber(state?.characterId, null),
+        skillIds: Array.isArray(state?.skillIds) ? state.skillIds.slice() : [],
+      };
+    });
+    if (isRealSeat(model.selfSeat)) {
+      const state = ensureSeatState(model, model.selfSeat);
+      state.isHuanJie = Boolean(model.selfIsHuanJie || state.isHuanJie);
+      state.uses = Math.max(0, Math.min(2, toNumber(model.uses, state.uses)));
+      state.turnToken = Math.max(0, toNumber(model.turnToken, state.turnToken));
+      state.lastResetTurnToken = toNumber(overrides.lastResetTurnToken, state.lastResetTurnToken);
+      state.skillIds = Array.from(new Set(state.skillIds.concat(model.selfSkillIds)));
+      syncSelfState(model);
+    }
+    return model;
+  }
+
+  function ensureSeatState(model, seat) {
+    const seatNumber = toNumber(seat, null);
+    if (!isRealSeat(seatNumber)) return null;
+    const key = String(seatNumber);
+    if (!model.seatStates[key]) {
+      model.seatStates[key] = {
+        isHuanJie: false,
+        uses: 0,
+        turnToken: 0,
+        lastResetTurnToken: null,
+        characterId: null,
+        skillIds: [],
+      };
+    }
+    return model.seatStates[key];
+  }
+
+  function syncSelfState(model) {
+    if (!isRealSeat(model.selfSeat)) return;
+    const state = ensureSeatState(model, model.selfSeat);
+    model.selfIsHuanJie = state.isHuanJie;
+    model.uses = state.uses;
+    model.selfSkillIds = state.skillIds.slice();
+  }
+
+  function markHuanJieSeat(model, seat, evidence = {}) {
+    const state = ensureSeatState(model, seat);
+    if (!state) return false;
+    let changed = false;
+    if (!state.isHuanJie) {
+      state.isHuanJie = true;
+      changed = true;
+    }
+    const characterId = toNumber(evidence.characterId, null);
+    if (characterId != null && state.characterId !== characterId) {
+      state.characterId = characterId;
+      changed = true;
+    }
+    const skillIds = extractSkillIds(evidence.skillIds || []);
+    const nextSkillIds = Array.from(new Set(state.skillIds.concat(skillIds)));
+    if (nextSkillIds.length !== state.skillIds.length) {
+      state.skillIds = nextSkillIds;
+      changed = true;
+    }
+    if (toNumber(seat, null) === model.selfSeat) syncSelfState(model);
+    return changed;
+  }
+
+  function resetMatchModel(model, reason = 'reset') {
+    model.currentTurnSeat = null;
+    model.currentPhase = '';
+    model.turnToken = 0;
+    model.uses = 0;
+    model.selfIsHuanJie = false;
+    model.selfSkillIds = [];
+    model.discoveredSkillId = null;
+    model.skillNamesById = {};
+    model.seatStates = {};
+    model.lastTransition = `已清理：${reason}`;
+    model.lastResetReason = reason;
+  }
+
+  function cacheSkillEvidence(model, payload, config = CONFIG) {
+    if (!payload || typeof payload !== 'object') return false;
+    let changed = false;
+    const queue = [{ value: payload, depth: 0 }];
+    const seen = new Set();
+    while (queue.length) {
+      const { value, depth } = queue.shift();
+      if (!value || typeof value !== 'object' || seen.has(value) || depth > 3) continue;
+      seen.add(value);
+      const id = payloadSkillId(value);
+      const name = payloadSkillName(value);
+      if (id != null && name) {
+        if (model.skillNamesById[id] !== name) {
+          model.skillNamesById[id] = name;
+          changed = true;
+        }
+        if (includesAnyName(name, config.skillNames) && model.discoveredSkillId !== id) {
+          model.discoveredSkillId = id;
+          changed = true;
+        }
+      }
+      Object.keys(value).slice(0, 60).forEach((key) => {
+        let nested;
+        try { nested = value[key]; } catch { return; }
+        if (nested && typeof nested === 'object') queue.push({ value: nested, depth: depth + 1 });
+      });
+    }
+    return changed;
+  }
+
+  function payloadLooksLikeJianli(payload, model, config = CONFIG) {
+    if (!payload || typeof payload !== 'object') return false;
+    const id = payloadSkillId(payload);
+    if (id != null && (id === toNumber(config.skillId, null) || id === toNumber(model.discoveredSkillId, null))) return true;
+    if (includesAnyName(payloadSkillName(payload), config.skillNames)) return true;
+    return id != null && includesAnyName(model.skillNamesById[id], config.skillNames);
+  }
+
+  function cacheIdentityEvidence(model, payload, config = CONFIG) {
+    if (!payload || typeof payload !== 'object') return false;
+    const seat = payloadCasterSeat(payload);
+    if (!isRealSeat(seat)) return false;
+    const characterId = payloadCharacterId(payload);
+    const characterMatches = characterId === toNumber(config.characterId, null)
+      || includesAnyName(payloadCharacterName(payload), config.characterNames);
+    if (characterMatches || payloadLooksLikeJianli(payload, model, config)) {
+      return markHuanJieSeat(model, seat, { characterId });
+    }
+    return false;
+  }
+
+  function isConfirmedJianliActivation(type, payload, model, config = CONFIG) {
+    const typeText = normalizeMessageType(type, payload);
+    if (!typeText || FORBIDDEN_ACTIVATION_MESSAGE.test(typeText)) return false;
+    if (!CONFIRMED_ACTIVATION_MESSAGE.test(typeText)) return false;
+    if (!payloadLooksLikeJianli(payload, model, config)) return false;
+    const caster = payloadCasterSeat(payload);
+    return isRealSeat(caster) && model.currentPhase === 'play' && model.currentTurnSeat === caster;
+  }
+
+  function reduceMessage(model, type, payload = {}, config = CONFIG) {
+    const typeText = normalizeMessageType(type, payload);
+    if (!typeText) return { changed: false, activation: false, reset: false };
+    let changed = false;
+    let reset = false;
+    if (RESET_MESSAGE.test(typeText)) {
+      resetMatchModel(model, typeText);
+      changed = true;
+      reset = true;
+    }
+    if (cacheSkillEvidence(model, payload, config)) changed = true;
+    if (cacheIdentityEvidence(model, payload, config)) changed = true;
+
+    if (typeText === 'MsgGameSetCharacter' || typeText === 'MsgDealCharacters') {
+      const characters = payload.characterInfo ?? payload.characters ?? payload.characterInfos ?? payload.roles ?? [];
+      if (Array.isArray(characters)) characters.forEach((character) => {
+        const seat = payloadCasterSeat(character);
+        const characterId = payloadCharacterId(character);
+        if (characterId === toNumber(config.characterId, null)
+          || includesAnyName(payloadCharacterName(character), config.characterNames)) {
+          if (markHuanJieSeat(model, seat, { characterId })) changed = true;
+        }
+      });
+    }
+
+    if (['MsgSetCharacterSpell', 'MsgAddCharacterSpell', 'MsgRemoveCharacterSpell'].includes(typeText)) {
+      const seat = toNumber(payload.seat ?? payload.ownerSeat ?? payload.srcSeat, null);
+      if (isRealSeat(seat)) {
+        const state = ensureSeatState(model, seat);
+        const incoming = extractSkillIds(payload.spellIds ?? payload.skillIds ?? payload.spells ?? payload.skills ?? []);
+        if (typeText === 'MsgSetCharacterSpell') state.skillIds = incoming;
+        if (typeText === 'MsgAddCharacterSpell') state.skillIds = Array.from(new Set(state.skillIds.concat(incoming)));
+        if (typeText === 'MsgRemoveCharacterSpell') {
+          const removed = new Set(incoming);
+          state.skillIds = state.skillIds.filter((id) => !removed.has(id));
+        }
+        const matchesCharacter = payloadCharacterId(payload) === toNumber(config.characterId, null)
+          || includesAnyName(payloadCharacterName(payload), config.characterNames);
+        const knownIds = [toNumber(config.skillId, null), toNumber(model.discoveredSkillId, null)].filter((id) => id != null);
+        if (matchesCharacter || knownIds.some((id) => state.skillIds.includes(id))) {
+          if (markHuanJieSeat(model, seat, { characterId: payloadCharacterId(payload) })) changed = true;
+        }
+        if (seat === model.selfSeat) syncSelfState(model);
+        changed = true;
+      }
+    }
+
+    if (typeText === 'MsgGameTurnNtf') {
+      const seat = toNumber(payload.currentSeat ?? payload.turnSeat ?? payload.seat ?? payload.srcSeat, null);
+      if (isRealSeat(seat)) {
+        model.turnToken += 1;
+        const state = ensureSeatState(model, seat);
+        state.turnToken += 1;
+        model.currentTurnSeat = seat;
+        model.currentPhase = '';
+        model.lastTransition = `新回合：座位${seat}`;
+        changed = true;
+      }
+    }
+
+    if (typeText === 'MsgSetGamePhaseNtf') {
+      const phase = normalizePhase(payload.phase);
+      const seat = toNumber(payload.currentSeat ?? payload.turnSeat ?? payload.seat ?? payload.srcSeat ?? payload.userSeat, model.currentTurnSeat);
+      if (isRealSeat(seat)) model.currentTurnSeat = seat;
+      model.currentPhase = phase;
+      if (phase === '0' && isRealSeat(seat)) {
+        model.turnToken += 1;
+        ensureSeatState(model, seat).turnToken += 1;
+      }
+      const active = isRealSeat(model.currentTurnSeat) ? ensureSeatState(model, model.currentTurnSeat) : null;
+      if (phase === 'play' && active?.isHuanJie && active.lastResetTurnToken !== active.turnToken) {
+        active.uses = 0;
+        active.lastResetTurnToken = active.turnToken;
+        model.lastResetReason = `huan-jie-play:${model.currentTurnSeat}:${active.turnToken}`;
+        model.lastTransition = `座位${model.currentTurnSeat}进入出牌阶段：谏立次数已重置`;
+      } else {
+        model.lastTransition = `阶段：${phase || '未知'}`;
+      }
+      syncSelfState(model);
+      changed = true;
+    }
+
+    const activation = isConfirmedJianliActivation(typeText, payload, model, config);
+    if (activation) {
+      const caster = payloadCasterSeat(payload);
+      markHuanJieSeat(model, caster, { characterId: payloadCharacterId(payload) });
+      const state = ensureSeatState(model, caster);
+      state.uses = Math.min(2, state.uses + 1);
+      if (caster === model.selfSeat) syncSelfState(model);
+      model.lastTransition = `座位${caster}谏立确认发动：${state.uses}次`;
+      changed = true;
+    }
+    return { changed, activation, reset };
+  }
+
+  function derivePresentation(model, seat = model.selfSeat) {
+    const seatNumber = toNumber(seat, null);
+    const state = isRealSeat(seatNumber) ? model.seatStates[String(seatNumber)] : null;
+    const isHuanJie = seatNumber === model.selfSeat
+      ? Boolean(model.selfIsHuanJie || state?.isHuanJie)
+      : Boolean(state?.isHuanJie);
+    if (!isHuanJie || model.currentTurnSeat !== seatNumber || model.currentPhase !== 'play') return null;
+    const uses = seatNumber === model.selfSeat
+      ? Math.max(0, Math.min(2, toNumber(model.uses, state?.uses || 0)))
+      : Math.max(0, Math.min(2, toNumber(state?.uses, 0)));
+    if (uses >= 2) return { text: '谏立已失效', color: '#d8bd83', borderColor: '#9b865b' };
+    if (uses === 1) return { text: '谏立可发动次数 1 次', color: '#f4d17b', borderColor: '#b88942' };
+    return { text: '谏立可发动次数 2 次', color: '#a9f0af', borderColor: '#75b979' };
+  }
+
+  function derivePresentations(model) {
+    const result = {};
+    Object.keys(model.seatStates || {}).forEach((seat) => {
+      const presentation = derivePresentation(model, Number(seat));
+      if (presentation) result[seat] = presentation;
+    });
+    return result;
+  }
+
+  function messageSignature(type, payload = {}) {
+    return JSON.stringify({
+      type: normalizeMessageType(type, payload),
+      seat: payload.seat ?? payload.srcSeat ?? payload.ownerSeat ?? payload.currentSeat ?? null,
+      phase: payload.phase ?? null,
+      skillId: payload.spellId ?? payload.skillId ?? null,
+      skillName: payload.spellName ?? payload.skillName ?? null,
+      characterId: payload.ownerCharacterId ?? payload.characterId ?? payload.generalId ?? null,
+      targets: Array.isArray(payload.targets) ? payload.targets.slice(0, 12) : null,
+    });
+  }
+
+  function createMessageReceiver(handler, options = {}) {
+    const recent = new Map();
+    const now = typeof options.now === 'function' ? options.now : Date.now;
+    const dedupeMs = toNumber(options.dedupeMs, CONFIG.dedupeMs);
+    return function receive(source, type, payload = {}) {
+      const normalizedType = normalizeMessageType(type, payload);
+      if (!normalizedType) return { processed: false, duplicate: false };
+      const signature = messageSignature(normalizedType, payload);
+      const at = now();
+      const previousAt = recent.get(signature);
+      if (previousAt != null && at - previousAt < dedupeMs) {
+        options.onDuplicate?.(source, normalizedType, payload);
+        return { processed: false, duplicate: true };
+      }
+      recent.set(signature, at);
+      for (const [key, timestamp] of recent) if (at - timestamp > dedupeMs * 4) recent.delete(key);
+      handler(normalizedType, payload, source);
+      return { processed: true, duplicate: false };
+    };
+  }
+
+  function readGeneralId(object) {
+    return toNumber(object && (object.GeneralId ?? object.generalId ?? object.CharacterId ?? object.characterId), null);
+  }
+
+  function readGeneralName(object) {
+    return String(object && (object.GeneralName ?? object.generalName ?? object.CharacterName ?? object.characterName) || '');
+  }
+
+  function readSeatSkillIds(object) {
+    return extractSkillIds(object && (object.spellIds ?? object.skillIds ?? object.SpellIds ?? object.skills) || []);
+  }
+
+  function readSelfSeat(manager) {
+    return toNumber(manager && (manager.selfSeatIndex ?? manager.SelfSeatIndex ?? manager.selfSeat ?? manager.SelfSeat), null);
+  }
+
+  function refreshIdentity(model) {
+    const overlay = app.getService('seatOverlay');
+    const manager = overlay?.findGameManager?.();
+    if (!manager) return false;
+    const selfSeat = readSelfSeat(manager);
+    if (isRealSeat(selfSeat)) model.selfSeat = selfSeat;
+    let changed = false;
+    for (let seat = 0; seat < 12; seat += 1) {
+      const object = overlay.readSeatObject?.(manager, seat);
+      if (!object) continue;
+      const characterId = readGeneralId(object);
+      const characterName = readGeneralName(object);
+      const skillIds = readSeatSkillIds(object);
+      const isHuanJie = characterId === CONFIG.characterId
+        || includesAnyName(characterName, CONFIG.characterNames)
+        || skillIds.includes(CONFIG.skillId)
+        || (model.discoveredSkillId != null && skillIds.includes(model.discoveredSkillId));
+      if (isHuanJie && markHuanJieSeat(model, seat, { characterId, skillIds })) changed = true;
+    }
+    syncSelfState(model);
+    return changed;
+  }
+
+  function createSeatStripRenderer(getOverlay = () => app.getService('seatOverlay')) {
+    const displayed = new Map();
+    const stats = { showCalls: 0, clearCalls: 0, skippedSameText: 0, lastError: '' };
+    const keyForSeat = (seat) => `${CONFIG.stripKeyPrefix}${seat}`;
+    function clearSeat(seat) {
+      if (!displayed.has(String(seat))) return;
+      try { getOverlay()?.clear?.(keyForSeat(seat)); stats.clearCalls += 1; }
+      catch (error) { stats.lastError = String(error?.message || error); }
+      displayed.delete(String(seat));
+    }
+    function render(hints = {}) {
+      const allSeats = new Set([...displayed.keys(), ...Object.keys(hints)]);
+      for (const seat of allSeats) {
+        const hint = hints[seat];
+        const previous = displayed.get(String(seat));
+        if (!hint) { clearSeat(seat); continue; }
+        if (previous?.text === hint.text && previous.color === hint.color) {
+          stats.skippedSameText += 1;
+          continue;
+        }
+        if (previous) clearSeat(seat);
+        try {
+          const ok = getOverlay()?.show?.(keyForSeat(seat), Number(seat), hint.text, {
+            font: 'FZBW',
+            fontSize: 16,
+            minFontSize: 12,
+            fitText: true,
+            textPaddingX: 4,
+            color: hint.color,
+            borderColor: hint.borderColor,
+            zOrder: 99999,
+          });
+          stats.showCalls += 1;
+          if (ok !== false) displayed.set(String(seat), { text: hint.text, color: hint.color });
+        } catch (error) { stats.lastError = String(error?.message || error); }
+      }
+    }
+    function clearAll() { Array.from(displayed.keys()).forEach(clearSeat); }
+    return { render, clearAll, displayed, stats };
+  }
+
+  const model = createModel();
+  const renderer = createSeatStripRenderer();
+  const runtime = {
+    hookAttached: false,
+    hookFailure: '',
+    lastMessageAt: '',
+    lastMessageType: '',
+    hints: {},
+    refreshCount: 0,
+    duplicates: 0,
+  };
+  let refreshTimer = 0;
+  let unsubscribe = null;
+
+  function refresh() {
+    refreshIdentity(model);
+    runtime.hints = derivePresentations(model);
+    runtime.refreshCount += 1;
+    renderer.render(runtime.hints);
+    return runtime.hints;
+  }
+
+  const receive = createMessageReceiver((type, payload) => {
+    runtime.lastMessageAt = new Date().toISOString();
+    runtime.lastMessageType = type;
+    reduceMessage(model, type, payload, CONFIG);
+    refresh();
+  }, { onDuplicate() { runtime.duplicates += 1; } });
+
+  function onMessage(type, payload = {}) {
+    return receive('gameMessages', type, payload);
+  }
+
+  function attachMessageBus() {
+    if (runtime.hookAttached) return true;
+    const messages = app.getService('gameMessages');
+    if (!messages?.subscribe) return false;
+    try {
+      unsubscribe = messages.subscribe((type, payload) => onMessage(type, payload || {}));
+      runtime.hookAttached = true;
+      return true;
+    } catch (error) {
+      runtime.hookFailure = String(error?.message || error);
+      return false;
+    }
+  }
+
+  function cloneDiagnostic(value, depth = 0, seen = new Set()) {
+    if (depth > 4 || value == null) return value == null ? value : String(value);
+    if (['string', 'number', 'boolean'].includes(typeof value)) return value;
+    if (typeof value !== 'object') return String(value);
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+    if (Array.isArray(value)) return value.slice(0, 40).map((item) => cloneDiagnostic(item, depth + 1, seen));
+    const output = {};
+    Object.keys(value).slice(0, 80).forEach((key) => {
+      try { output[key] = cloneDiagnostic(value[key], depth + 1, seen); }
+      catch { output[key] = '[Unreadable]'; }
+    });
+    return output;
+  }
+
+  function diagnostic() {
+    refresh();
+    return {
+      module: 'hero.huan-jie.jianli',
+      version: CONFIG.version,
+      exportedAt: new Date().toISOString(),
+      config: { characterId: CONFIG.characterId, skillId: CONFIG.skillId },
+      runtime: cloneDiagnostic(runtime),
+      state: cloneDiagnostic(model),
+      renderStats: cloneDiagnostic(renderer.stats),
+    };
+  }
+
+  async function copyDiagnostic() {
+    const text = JSON.stringify(diagnostic(), null, 2);
+    if (navigator.clipboard?.writeText) {
+      try { await navigator.clipboard.writeText(text); return text; } catch {}
+    }
+    if (!document.body) return text;
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand?.('copy');
+    textarea.remove();
+    return text;
+  }
+
+  function destroy() {
+    if (refreshTimer) clearInterval(refreshTimer);
+    refreshTimer = 0;
+    unsubscribe?.();
+    unsubscribe = null;
+    runtime.hookAttached = false;
+    renderer.clearAll();
+  }
+
+  const api = Object.freeze({
+    version: CONFIG.version,
+    state: runtime,
+    refresh,
+    probe: diagnostic,
+    exportDiagnostic: diagnostic,
+    copyDiagnostic,
+    onMessage,
+    destroy,
+    __test: Object.freeze({
+      normalizePhase,
+      normalizeMessageType,
+      createModel,
+      reduceMessage,
+      derivePresentation,
+      derivePresentations,
+      createMessageReceiver,
+      createSeatStripRenderer,
+      refreshIdentity,
+    }),
+  });
+  window.HuanJieJianliHelper = api;
+
+  app.registerModule({
+    id: 'hero.huan-jie.jianli',
+    type: 'hero',
+    name: '桓阶·谏立',
+    version: CONFIG.version,
+    description: '在场上桓阶的出牌阶段显示谏立剩余发动次数，确认发动两次后显示失效。',
+    capabilities: ['game-message-read', 'seat-overlay', 'diagnostic-export'],
+    characterIds: [CONFIG.characterId],
+    skillIds: [CONFIG.skillId],
+    api,
+  });
+
+  if (!attachMessageBus()) runtime.hookFailure = '三国杀91助手内置消息服务不可用';
+  refreshTimer = setInterval(refresh, CONFIG.refreshIntervalMs);
+  setTimeout(refresh, 0);
+})();
+
+// ---- src/heroes/linglie-shouhu.user.js ----
+(function () {
+  'use strict';
+
+  const app = window.SGS91Assistant;
+  if (!app) throw new Error('SGS91 core must load before Linglie Shouhu module.');
+  if (app.getModule('hero.linglie.shouhu')) return;
+
+  const CONFIG = Object.freeze({
+    characterId: 1126,
+    shouhuSkillId: 3757,
+    yizhunSkillId: 3758,
+    stripKey: 'sgs91-linglie-shouhu',
+  });
+
+  const state = {
+    selfSeat: null,
+    selfIsLinglie: false,
+    currentTurnSeat: null,
+    currentPhase: '',
+    shouhuStatus: 'unknown',
+    selfSkillIds: [],
+    lastStatusAt: '',
+    lastRenderMode: 'hidden',
+    recentMessages: [],
+    hookStatus: {
+      jndSeen: false,
+      jndHooked: false,
+      sgsModuleSeen: false,
+      sgsModuleHooked: false,
+      internalMessagesHooked: false,
+    },
+  };
+
+  const recentSignatures = new Map();
+  let layaStrip = null;
+
+  function toNumber(value, fallback = null) {
+    if (value === '' || value == null) return fallback;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  }
+
+  function isRealSeat(value) {
+    const seat = toNumber(value, null);
+    return seat != null && seat >= 0 && seat < 12;
+  }
+
+  function normalizePhase(value) {
+    if (value === 4 || value === '4' || value === 'play' || value === '出牌阶段') return 'play';
+    return value == null ? '' : String(value);
+  }
+
+  function normalizeMessageType(type, payload) {
+    const text = typeof type === 'string' ? type : '';
+    const constructorName = payload?.__ctor || payload?.constructor?.name || '';
+    if (constructorName && constructorName !== 'Object' && (!text || /^(logicmsg|cmsg|object)$/i.test(text))) {
+      return constructorName;
+    }
+    return text;
+  }
+
+  function messageSignature(type, payload) {
+    return JSON.stringify({
+      type,
+      seat: payload?.seat ?? null,
+      ownerSeat: payload?.ownerSeat ?? null,
+      srcSeat: payload?.srcSeat ?? null,
+      currentSeat: payload?.currentSeat ?? null,
+      phase: payload?.phase ?? null,
+      spellId: payload?.spellId ?? payload?.skillId ?? null,
+      id: payload?.id ?? null,
+      data: Array.isArray(payload?.data) ? payload.data.slice(0, 8) : null,
+      spellIds: Array.isArray(payload?.spellIds) ? payload.spellIds.slice(0, 20) : null,
+    });
+  }
+
+  function rememberMessage(type, payload, source) {
+    state.recentMessages.push({
+      at: new Date().toISOString(),
+      source,
+      type,
+      payload: {
+        seat: payload?.seat ?? null,
+        ownerSeat: payload?.ownerSeat ?? null,
+        srcSeat: payload?.srcSeat ?? null,
+        currentSeat: payload?.currentSeat ?? null,
+        phase: payload?.phase ?? null,
+        spellId: payload?.spellId ?? payload?.skillId ?? null,
+        ownerCharacterId: payload?.ownerCharacterId ?? payload?.characterId ?? null,
+        id: payload?.id ?? null,
+        data: Array.isArray(payload?.data) ? payload.data.slice(0, 12) : null,
+        spellIds: Array.isArray(payload?.spellIds) ? payload.spellIds.slice(0, 30) : null,
+      },
+    });
+    if (state.recentMessages.length > 50) state.recentMessages.splice(0, state.recentMessages.length - 50);
+  }
+
+  function findGameManager() {
+    try {
+      const manager = window.__JND?.findGameManager?.();
+      if (manager) return manager;
+    } catch {
+    }
+    const stage = window.Laya?.stage;
+    if (!stage) return null;
+    const queue = [stage];
+    const seen = new Set();
+    while (queue.length && seen.size < 500) {
+      const object = queue.shift();
+      if (!object || typeof object !== 'object' || seen.has(object)) continue;
+      seen.add(object);
+      if (object.gameManager?.Seats || object.gameManager?.seats) return object.gameManager;
+      if ((object.Seats || object.seats) && (
+        object.selfSeatIndex != null || object.SelfSeatIndex != null || object.selfSeat != null
+      )) return object;
+      if (Array.isArray(object._children)) queue.push(...object._children);
+    }
+    return null;
+  }
+
+  function readSeatObject(manager, seat) {
+    const seats = manager?.Seats || manager?.seats;
+    if (!seats || seat == null) return null;
+    try {
+      return seats[seat] || seats.getNumberKey?.(seat) || null;
+    } catch {
+      return null;
+    }
+  }
+
+  function extractSkillIds(value) {
+    if (!Array.isArray(value)) return [];
+    return value.map((item) => {
+      if (typeof item === 'number' || typeof item === 'string') return toNumber(item, null);
+      return toNumber(item?.spellId ?? item?.skillId ?? item?.id, null);
+    }).filter((item) => item != null);
+  }
+
+  function refreshIdentityFromGame() {
+    const seatObject = readSeatObject(findGameManager(), state.selfSeat);
+    if (!seatObject) return;
+    const characterId = toNumber(
+      seatObject.GeneralId ?? seatObject.generalId ?? seatObject.characterId
+      ?? seatObject.CharacterId ?? seatObject.heroId,
+      null,
+    );
+    const skillIds = extractSkillIds(
+      seatObject.spellIds ?? seatObject.skillIds ?? seatObject.spells ?? seatObject.skills
+      ?? seatObject.SpellIds ?? seatObject.SkillIds,
+    );
+    if (characterId != null) {
+      state.selfIsLinglie = characterId === CONFIG.characterId;
+      return;
+    }
+    if (skillIds.length) {
+      state.selfSkillIds = skillIds;
+      state.selfIsLinglie = skillIds.includes(CONFIG.shouhuSkillId) || skillIds.includes(CONFIG.yizhunSkillId);
+    }
+  }
+
+  function readSelfSeat() {
+    try {
+      const seat = window.__JND?.selfSeatIndex?.();
+      if (isRealSeat(seat)) return toNumber(seat, null);
+    } catch {
+    }
+    const manager = findGameManager();
+    const managerSeat = toNumber(manager?.selfSeatIndex ?? manager?.SelfSeatIndex ?? manager?.selfSeat, null);
+    if (isRealSeat(managerSeat)) return managerSeat;
+    return isRealSeat(state.selfSeat) ? state.selfSeat : null;
+  }
+
+  function clearStrip() {
+    try {
+      app.getService?.('seatOverlay')?.clear?.(CONFIG.stripKey);
+    } catch {
+    }
+    try {
+      window.__JND?.clearSeatSkillStrip?.(CONFIG.stripKey);
+    } catch {
+    }
+    if (layaStrip) {
+      try { layaStrip.removeSelf(); } catch {}
+      layaStrip = null;
+    }
+    document.getElementById('sgs91-linglie-shouhu-dom')?.remove();
+  }
+
+  function renderSharedStrip(presentation) {
+    const overlay = app.getService?.('seatOverlay');
+    if (!overlay?.show || state.selfSeat == null) return false;
+    try {
+      const rendered = overlay.show(CONFIG.stripKey, state.selfSeat, presentation.text, {
+        font: 'FZBW',
+        fontSize: 16,
+        minFontSize: 10,
+        fitText: true,
+        textPaddingX: 4,
+        color: presentation.color,
+        borderColor: presentation.borderColor,
+        zOrder: 99999,
+      }) === true;
+      if (rendered) state.lastRenderMode = 'sgs91-seat-overlay';
+      return rendered;
+    } catch {
+      return false;
+    }
+  }
+
+  function resetGameState() {
+    state.selfSeat = readSelfSeat();
+    state.selfIsLinglie = false;
+    state.selfSkillIds = [];
+    state.currentTurnSeat = null;
+    state.currentPhase = '';
+    state.shouhuStatus = 'unknown';
+    state.lastStatusAt = '';
+    state.lastRenderMode = 'hidden';
+    clearStrip();
+  }
+
+  function findSeatAvatar(seat) {
+    const seatObject = readSeatObject(findGameManager(), seat);
+    const direct = seatObject?.SeatUI?.seatAvatar || seatObject?.seatUI?.seatAvatar
+      || seatObject?.SeatUI?.avatar || seatObject?.seatUI?.avatar;
+    if (direct && typeof direct.localToGlobal === 'function') return direct;
+    try {
+      const fromJnd = window.__JND?.getSeatAvatar?.(seat);
+      if (fromJnd && typeof fromJnd.localToGlobal === 'function') return fromJnd;
+    } catch {
+    }
+    return null;
+  }
+
+  function findSeatComboLayer() {
+    try {
+      const box = window.__JND?._box;
+      const layer = box?.comboLayer || box?.seatComboLayer || box?.seatLayer || box?.gameLayer;
+      if (layer && typeof layer.globalToLocal === 'function') return layer;
+    } catch {
+    }
+    const stage = window.Laya?.stage;
+    if (!stage) return null;
+    const queue = [stage];
+    const seen = new Set();
+    while (queue.length && seen.size < 500) {
+      const object = queue.shift();
+      if (!object || typeof object !== 'object' || seen.has(object)) continue;
+      seen.add(object);
+      const name = object.name || object.constructor?.name || '';
+      if (/seatComboSprite/i.test(name) && typeof object.globalToLocal === 'function') return object;
+      if (Array.isArray(object._children)) queue.push(...object._children);
+    }
+    return null;
+  }
+
+  function renderJndStrip(presentation) {
+    const jnd = window.__JND;
+    if (!jnd || typeof jnd.showSeatSkillStrip !== 'function' || state.selfSeat == null) return false;
+    try {
+      const rendered = jnd.showSeatSkillStrip(CONFIG.stripKey, state.selfSeat, presentation.text, {
+        fontSize: 13,
+        minFontSize: 10,
+        fitText: true,
+        textPaddingX: 4,
+        color: presentation.color,
+        zOrder: 99999,
+      }) === true;
+      if (rendered) state.lastRenderMode = 'jnd';
+      return rendered;
+    } catch {
+      return false;
+    }
+  }
+
+  function renderLayaStrip(presentation) {
+    const Laya = window.Laya;
+    const avatar = findSeatAvatar(state.selfSeat);
+    const layer = findSeatComboLayer();
+    if (!Laya?.Sprite || !Laya?.Text || !Laya?.Point || !avatar || !layer || typeof layer.globalToLocal !== 'function') {
+      return false;
+    }
+    if (layaStrip) {
+      try { layaStrip.removeSelf(); } catch {}
+      layaStrip = null;
+    }
+    try {
+      const width = 96;
+      const height = 22;
+      const center = avatar.localToGlobal(new Laya.Point((avatar.width || 0) / 2, (avatar.height || 0) / 2), true);
+      const local = layer.globalToLocal(new Laya.Point(center.x, center.y), true);
+      const strip = new Laya.Sprite();
+      strip.name = 'sgs91-linglie-shouhu-strip';
+      strip.zOrder = 99999;
+      strip.alpha = 0.94;
+      strip.size(width, height);
+      strip.pos(Math.round(local.x - width / 2), Math.round(local.y - (avatar.height || 82) / 2 - height - 4));
+      try { strip.graphics.drawRect(0, 0, width, height, '#2b2b2b', presentation.borderColor, 1); }
+      catch { strip.graphics.drawRect(0, 0, width, height, '#2b2b2b'); }
+      const label = new Laya.Text();
+      label.text = presentation.text;
+      label.font = 'FZBW';
+      label.fontSize = 13;
+      label.bold = true;
+      label.color = presentation.color;
+      label.align = 'center';
+      label.valign = 'middle';
+      label.width = width;
+      label.height = height;
+      strip.addChild(label);
+      layer.addChild(strip);
+      layaStrip = strip;
+      state.lastRenderMode = 'laya';
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  function renderDomStrip(presentation) {
+    if (!document.body) return false;
+    let element = document.getElementById('sgs91-linglie-shouhu-dom');
+    if (!element) {
+      element = document.createElement('div');
+      element.id = 'sgs91-linglie-shouhu-dom';
+      document.body.appendChild(element);
+    }
+    element.textContent = presentation.text;
+    Object.assign(element.style, {
+      position: 'fixed',
+      left: '50%',
+      bottom: '154px',
+      transform: 'translateX(-50%)',
+      zIndex: '99998',
+      minWidth: '88px',
+      height: '22px',
+      boxSizing: 'border-box',
+      padding: '2px 6px',
+      border: `1px solid ${presentation.borderColor}`,
+      borderRadius: '2px',
+      background: 'rgba(43, 43, 43, .94)',
+      color: presentation.color,
+      font: '700 13px/16px FZBW, "Microsoft YaHei", sans-serif',
+      textAlign: 'center',
+      whiteSpace: 'nowrap',
+      pointerEvents: 'none',
+      boxShadow: '0 2px 6px rgba(0, 0, 0, .35)',
+    });
+    state.lastRenderMode = 'dom';
+    return true;
+  }
+
+  function render() {
+    state.selfSeat = readSelfSeat();
+    refreshIdentityFromGame();
+    const isOwnPlayPhase = state.selfSeat != null
+      && state.currentTurnSeat === state.selfSeat
+      && state.currentPhase === 'play';
+    if (!state.selfIsLinglie || !isOwnPlayPhase) {
+      state.lastRenderMode = 'hidden';
+      clearStrip();
+      return;
+    }
+    const presentation = state.shouhuStatus === 'ready'
+      ? { text: '狩虎 可用', color: '#a9f0af', borderColor: '#75b979' }
+      : state.shouhuStatus === 'used'
+        ? { text: '狩虎 不可用', color: '#d8bd83', borderColor: '#9b865b' }
+        : { text: '狩虎 检测中', color: '#b8b8b8', borderColor: '#777777' };
+    if (renderSharedStrip(presentation) || renderJndStrip(presentation)) {
+      if (layaStrip) {
+        try { layaStrip.removeSelf(); } catch {}
+        layaStrip = null;
+      }
+      document.getElementById('sgs91-linglie-shouhu-dom')?.remove();
+      return;
+    }
+    if (renderLayaStrip(presentation)) {
+      document.getElementById('sgs91-linglie-shouhu-dom')?.remove();
+      return;
+    }
+    renderDomStrip(presentation);
+  }
+
+  function onMessage(type, payload = {}, source = 'api') {
+    type = normalizeMessageType(type, payload);
+    if (!type) return;
+    rememberMessage(type, payload, source);
+    state.selfSeat = readSelfSeat();
+    if ((type === 'MsgGameHandCardNtf' || type === 'MsgGamePlayCardNtf') && state.selfSeat == null) {
+      const inferredSeat = toNumber(payload.seat ?? payload.userSeat ?? payload.ownerSeat, null);
+      if (isRealSeat(inferredSeat)) state.selfSeat = inferredSeat;
+    }
+    if (type === 'MsgDealCharacters') resetGameState();
+    if ([
+      'MsgGameOver', 'NotifyGameOver', 'CRespLobbyTableLeave', 'CNotifyTableLeave',
+      'CRespTableLeave', 'CNotifyTableExit', 'CRespTableExit',
+    ].includes(type)) {
+      resetGameState();
+      return;
+    }
+    if (type === 'MsgSetCharacterSpell' || type === 'MsgAddCharacterSpell' || type === 'MsgRemoveCharacterSpell') {
+      const seat = toNumber(payload.seat ?? payload.ownerSeat ?? payload.srcSeat, null);
+      const skills = payload.spellIds ?? payload.skillIds ?? payload.spells ?? payload.skills ?? [];
+      if (seat === state.selfSeat) {
+        const incoming = extractSkillIds(skills);
+        if (type === 'MsgSetCharacterSpell') state.selfSkillIds = incoming;
+        if (type === 'MsgAddCharacterSpell') state.selfSkillIds = Array.from(new Set(state.selfSkillIds.concat(incoming)));
+        if (type === 'MsgRemoveCharacterSpell') {
+          const removed = new Set(incoming);
+          state.selfSkillIds = state.selfSkillIds.filter((id) => !removed.has(id));
+        }
+        state.selfIsLinglie = state.selfSkillIds.includes(CONFIG.shouhuSkillId)
+          || state.selfSkillIds.includes(CONFIG.yizhunSkillId);
+      }
+    }
+    if (type === 'MsgGameTurnNtf') {
+      const nextSeat = toNumber(payload.currentSeat ?? payload.turnSeat ?? payload.seat ?? payload.srcSeat, null);
+      if (nextSeat !== state.currentTurnSeat) state.currentPhase = '';
+      state.currentTurnSeat = isRealSeat(nextSeat) ? nextSeat : null;
+    }
+    if (type === 'MsgSetGamePhaseNtf') {
+      state.currentPhase = normalizePhase(payload.phase);
+      const seat = toNumber(payload.currentSeat ?? payload.turnSeat ?? payload.seat ?? payload.srcSeat, null);
+      if (seat != null) state.currentTurnSeat = seat;
+      if (state.currentPhase === 'play' && state.currentTurnSeat === state.selfSeat) {
+        state.shouhuStatus = 'ready';
+        state.lastStatusAt = new Date().toISOString();
+      }
+    }
+    if (type === 'MsgUseSpell') {
+      const ownerSeat = toNumber(payload.ownerSeat ?? payload.srcSeat ?? payload.userSeat ?? payload.seat, null);
+      const characterId = toNumber(payload.ownerCharacterId ?? payload.characterId ?? payload.generalId, null);
+      const skillId = toNumber(payload.spellId ?? payload.skillId ?? payload.id, null);
+      if (ownerSeat === state.selfSeat && skillId === CONFIG.shouhuSkillId
+        && (state.selfIsLinglie || characterId === CONFIG.characterId)) {
+        if (characterId === CONFIG.characterId) state.selfIsLinglie = true;
+        state.shouhuStatus = 'used';
+        state.lastStatusAt = new Date().toISOString();
+      }
+    }
+    if (type === 'MsgUpdateRoleDataExNtf') {
+      const seat = toNumber(payload.seat ?? payload.ownerSeat ?? payload.srcSeat, null);
+      const id = toNumber(payload.id, null);
+      const data = Array.isArray(payload.data) ? payload.data.map(Number) : [];
+      if (seat === state.selfSeat && id === CONFIG.shouhuSkillId && data[0] === 0 && data[1] === 0) {
+        state.selfIsLinglie = true;
+        state.shouhuStatus = 'ready';
+        state.lastStatusAt = new Date().toISOString();
+      }
+    }
+    render();
+  }
+
+  function receiveMessage(source, type, payload = {}) {
+    const normalizedType = normalizeMessageType(type, payload);
+    if (!normalizedType) return;
+    const signature = messageSignature(normalizedType, payload);
+    const now = Date.now();
+    const previousAt = recentSignatures.get(signature) || 0;
+    if (now - previousAt < 120) return;
+    recentSignatures.set(signature, now);
+    if (recentSignatures.size > 80) {
+      for (const [key, at] of recentSignatures) {
+        if (now - at > 2000) recentSignatures.delete(key);
+      }
+    }
+    onMessage(normalizedType, payload, source);
+  }
+
+  function extractMessage(args) {
+    if (typeof args[0] === 'string') return { type: args[0], payload: args[1] || {} };
+    const object = args.find((item) => item && typeof item === 'object');
+    if (!object) return { type: '', payload: {} };
+    return {
+      type: object.type || object.rawType || object.msgName || object.name || object.__ctor || object.constructor?.name || '',
+      payload: object.payload || object.data || object,
+    };
+  }
+
+  function attachJndBus() {
+    const jnd = window.__JND;
+    if (!jnd || typeof jnd !== 'object') return false;
+    state.hookStatus.jndSeen = true;
+    if (jnd.__sgs91LinglieShouhuHooked) {
+      state.hookStatus.jndHooked = true;
+      return true;
+    }
+    if (typeof jnd.onMsg !== 'function') return false;
+    jnd.onMsg((type, payload) => receiveMessage('jnd', type, payload || {}));
+    try { Object.defineProperty(jnd, '__sgs91LinglieShouhuHooked', { value: true }); }
+    catch { jnd.__sgs91LinglieShouhuHooked = true; }
+    state.hookStatus.jndHooked = true;
+    return true;
+  }
+
+  function attachSgsModule() {
+    const bus = window.SGSMODULE;
+    if (!Array.isArray(bus)) return false;
+    state.hookStatus.sgsModuleSeen = true;
+    if (bus.__sgs91LinglieShouhuHooked) {
+      state.hookStatus.sgsModuleHooked = true;
+      return true;
+    }
+    bus.push(function (...args) {
+      const message = extractMessage(args);
+      receiveMessage('sgsmodule', message.type, message.payload);
+    });
+    try { Object.defineProperty(bus, '__sgs91LinglieShouhuHooked', { value: true }); }
+    catch { bus.__sgs91LinglieShouhuHooked = true; }
+    state.hookStatus.sgsModuleHooked = true;
+    return true;
+  }
+
+  function attachInternalMessageBus() {
+    const messages = app.getService('gameMessages');
+    if (!messages || typeof messages.subscribe !== 'function' || state.hookStatus.internalMessagesHooked) return false;
+    messages.subscribe((type, payload) => receiveMessage('sgs91-core', type, payload || {}));
+    state.hookStatus.internalMessagesHooked = true;
+    return true;
+  }
+
+  function probe() {
+    return {
+      url: location.href,
+      selfSeat: state.selfSeat,
+      selfIsLinglie: state.selfIsLinglie,
+      currentTurnSeat: state.currentTurnSeat,
+      currentPhase: state.currentPhase,
+      shouhuStatus: state.shouhuStatus,
+      selfSkillIds: state.selfSkillIds.slice(),
+      lastStatusAt: state.lastStatusAt,
+      lastRenderMode: state.lastRenderMode,
+      hookStatus: { ...state.hookStatus },
+      recentMessages: state.recentMessages.map((item) => ({ ...item, payload: { ...item.payload } })),
+    };
+  }
+
+  async function copyDiagnostic() {
+    const text = JSON.stringify(probe(), null, 2);
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return text;
+      } catch {
+      }
+    }
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    document.body?.appendChild(textarea);
+    textarea.select();
+    document.execCommand?.('copy');
+    textarea.remove();
+    return text;
+  }
+
+  const api = Object.freeze({
+    state,
+    onMessage,
+    probe,
+    copyDiagnostic,
+    __test: Object.freeze({ normalizePhase, extractSkillIds }),
+  });
+  window.LinglieShouhuHelper = api;
+
+  app.registerModule({
+    id: 'hero.linglie.shouhu',
+    type: 'hero',
+    name: '凌烈·狩虎',
+    version: '1.0.0',
+    description: '在自己使用凌烈的出牌阶段显示狩虎可用、不可用或检测中状态。',
+    capabilities: ['game-message-read', 'seat-overlay', 'diagnostic-export'],
+    characterIds: [CONFIG.characterId],
+    skillIds: [CONFIG.shouhuSkillId, CONFIG.yizhunSkillId],
+    api,
+  });
+
+  attachInternalMessageBus();
+  attachJndBus();
+  attachSgsModule();
+  const hookTimer = setInterval(() => {
+    attachJndBus();
+    attachSgsModule();
+    attachInternalMessageBus();
+    render();
+  }, 500);
+  setTimeout(() => clearInterval(hookTimer), 180000);
+})();
+
 // ---- src/heroes/mou-deng-ai-juxi.user.js ----
 (function () {
   'use strict';
@@ -201,6 +2993,8 @@
     seatStripKey: 'mou-deng-ai-juxi-x',
     invalidStripPrefix: 'mou-deng-ai-juxi-invalid-',
     renderIntervalMs: 16,
+    hintFontName: 'FZBW',
+    seatStripFontSize: 16,
     cardBadgeFontSize: 20,
     cardBadgeXRatio: 0.4,
     cardBadgeYRatio: 1,
@@ -256,6 +3050,7 @@
     slashRemainingThisTurn: null,
     slashLimit: CONFIG.slashLimit,
     slashCounterSource: 'message-counter',
+    hasZhugeCrossbowEquipped: false,
     attackRange: CONFIG.defaultAttackRange,
     inGame: false,
     knownSeats: [],
@@ -286,6 +3081,7 @@
       bootAt: new Date().toISOString(),
       jndSeen: false,
       jndHooked: false,
+      internalMessagesHooked: false,
       pageBridgeInjected: false,
       pageBridgeReady: false,
       lastMessageAt: '',
@@ -355,6 +3151,18 @@
     });
   }
 
+  function getSlashRemainingUses(context) {
+    if (context.hasZhugeCrossbowEquipped === true) return Infinity;
+    if (context.slashRemainingThisTurn != null && Number.isFinite(Number(context.slashRemainingThisTurn))) {
+      return Math.max(0, Number(context.slashRemainingThisTurn));
+    }
+    const limit = context.slashLimit != null && context.slashLimit !== '' && Number.isFinite(Number(context.slashLimit))
+      ? Math.max(0, Number(context.slashLimit))
+      : 1;
+    const used = Number.isFinite(Number(context.slashUsedThisTurn)) ? Math.max(0, Number(context.slashUsedThisTurn)) : 0;
+    return Math.max(0, limit - used);
+  }
+
   function hasDistanceOneTarget(context) {
     return computeDistanceToOthers(context).some((seat) => {
       if (seat.targetKnown) return seat.targetable;
@@ -369,9 +3177,6 @@
   function judgeCardTargetability(card, context) {
     const name = normalizeCardName(card && card.name);
     const phase = context.currentPhase || '';
-    const slashUsed = Number(context.slashUsedThisTurn || 0);
-    const rawSlashLimit = context.slashLimit == null ? CONFIG.slashLimit : Number(context.slashLimit);
-    const slashLimit = Number.isFinite(rawSlashLimit) ? Math.max(0, rawSlashLimit) : Infinity;
 
     if (!name) return { ...card, name, canTargetOther: null, countsAsUnavailable: false, reason: '未识别牌名，暂不计入', confidence: 'unknown' };
     if (isEquipment(card)) return { ...card, name, canTargetOther: false, countsAsUnavailable: true, reason: '装备牌通常只能用于自己，不能指定其他角色', confidence: 'high' };
@@ -379,10 +3184,9 @@
 
     if (isSlashName(name)) {
       if (phase !== 'play') return { ...card, name, canTargetOther: false, countsAsUnavailable: true, reason: '当前不是出牌阶段，【杀】不能主动指定其他角色', confidence: 'medium' };
-      if (slashLimit <= 0) return { ...card, name, canTargetOther: false, countsAsUnavailable: true, reason: '本回合被限制为不能使用【杀】（0/0）', confidence: 'high' };
-      if (slashUsed >= slashLimit) return { ...card, name, canTargetOther: false, countsAsUnavailable: true, reason: `本回合【杀】次数已用完（${slashUsed}/${slashLimit}）`, confidence: 'medium' };
+      if (getSlashRemainingUses(context) <= 0) return { ...card, name, canTargetOther: false, countsAsUnavailable: true, reason: '本回合普通【杀】使用次数已用完', confidence: 'high' };
       if (!hasRangeTarget(context)) return { ...card, name, canTargetOther: false, countsAsUnavailable: true, reason: '当前攻击范围内没有可指定的其他角色', confidence: 'medium' };
-      return { ...card, name, canTargetOther: true, countsAsUnavailable: false, reason: '【杀】次数未用完且范围内有目标', confidence: 'medium' };
+      return { ...card, name, canTargetOther: true, countsAsUnavailable: false, reason: context.hasZhugeCrossbowEquipped === true ? '已装备【诸葛连弩】，且范围内有目标' : '本回合仍可使用普通【杀】，且范围内有目标', confidence: 'high' };
     }
 
     if (DISTANCE_ONE_TRICKS.has(name)) {
@@ -435,12 +3239,12 @@
     let cur = target;
     for (const name of path) {
       if (!cur || typeof cur !== 'object') return null;
-      cur = cur instanceof Array
+      cur = Array.isArray(cur)
         ? (cur.length ? cur.flatMap((item) => getChildren(item, name)) : [])
         : getChildren(cur, name);
-      if (cur instanceof Array) cur = single(cur);
+      if (Array.isArray(cur)) cur = single(cur);
     }
-    return cur && (cur instanceof Array ? (cur.length ? single(cur) : null) : cur) || null;
+    return cur && (Array.isArray(cur) ? (cur.length ? single(cur) : null) : cur) || null;
   }
 
   function getCardContainer() {
@@ -953,6 +3757,37 @@
     };
   }
 
+  function candidateHasCardName(candidate, expectedName) {
+    if (!candidate) return false;
+    return [candidate, candidate.theCard, candidate.card, candidate.cardData, candidate.data]
+      .filter(Boolean)
+      .some((item) => normalizeCardName(extractCardName(item)) === expectedName);
+  }
+
+  function readSeatHasEquippedCard(seat, expectedName) {
+    const seatObject = getSeatObject(seat);
+    const seatUi = seatObject && (seatObject.SeatUI || seatObject.seatUI);
+    const directCandidates = [
+      seatObject && seatObject.weapon,
+      seatObject && seatObject.Weapon,
+      seatObject && seatObject.weaponCard,
+      seatObject && seatObject.WeaponCard,
+      seatUi && seatUi.weapon,
+      seatUi && seatUi.weaponCard,
+    ].filter(Boolean);
+    if (directCandidates.some((item) => candidateHasCardName(item, expectedName))) return true;
+
+    const equipLists = [
+      seatObject && seatObject.equipCardUIs,
+      seatObject && seatObject.equipCards,
+      seatObject && seatObject.Equips,
+      seatObject && seatObject.equips,
+      seatUi && seatUi.equipCardUIs,
+      seatUi && seatUi.equipCards,
+    ].filter(Array.isArray);
+    return equipLists.some((list) => list.some((item) => candidateHasCardName(item, expectedName)));
+  }
+
   function readSeatHasWeapon(seat) {
     const seatObject = getSeatObject(seat);
     const seatUi = seatObject && (seatObject.SeatUI || seatObject.seatUI);
@@ -1287,9 +4122,27 @@
     ));
   }
 
+  function payloadHasJuxiSource(payload) {
+    if (!payload || typeof payload !== 'object') return false;
+    const juxiId = Number(CONFIG.skillIds.juxi);
+    return [
+      payload.sourceSpellId,
+      payload.sourceSkillId,
+      payload.reasonSpellId,
+      payload.reasonSkillId,
+      payload.parentSpellId,
+      payload.parentSkillId,
+      payload.fromSpellId,
+      payload.fromSkillId,
+      payload.triggerSpellId,
+      payload.triggerSkillId,
+    ].some((value) => toNumber(value, null) === juxiId);
+  }
+
   function payloadLooksLikeSlashUse(type, payload) {
     if (type !== 'MsgUseCard') return false;
     if (!payloadBelongsToSelf(payload)) return false;
+    if (payloadLooksLikeJuxiSkill(payload) || payloadHasJuxiSource(payload)) return false;
     if (isSlashName(payloadCardName(payload))) return true;
     const spellId = toNumber(payload && (payload.spellId ?? payload.SpellId), null);
     if (spellId !== 1) return false;
@@ -1427,6 +4280,10 @@
     if (!isRealSeat(seat)) return;
     delete state.pendingJuxiBySeat[seat];
     delete state.juxiInvalidMarks[seat];
+    try {
+      window.SGS91Assistant?.getService?.('seatOverlay')?.clear?.(`${CONFIG.invalidStripPrefix}${seat}`);
+    } catch {
+    }
     try {
       if (window.__JND && typeof window.__JND.clearSeatSkillStrip === 'function') {
         window.__JND.clearSeatSkillStrip(`${CONFIG.invalidStripPrefix}${seat}`);
@@ -1582,6 +4439,7 @@
     const managerTurnSeat = getCurrentTurnSeat();
     if (isRealSeat(managerTurnSeat)) state.currentTurnSeat = managerTurnSeat;
     state.attackRange = readAttackRange(state.selfSeat);
+    state.hasZhugeCrossbowEquipped = readSeatHasEquippedCard(state.selfSeat, '诸葛连弩');
     const slashCounter = readSelfSlashCounter(state.selfSeat);
     if (slashCounter) {
       state.slashRemainingThisTurn = slashCounter.remaining;
@@ -1610,7 +4468,9 @@
       selfSeat: state.selfSeat,
       attackRange: state.attackRange,
       slashUsedThisTurn: state.slashUsedThisTurn,
+      slashRemainingThisTurn: state.slashRemainingThisTurn,
       slashLimit: state.slashLimit,
+      hasZhugeCrossbowEquipped: state.hasZhugeCrossbowEquipped,
       seats: rows,
     });
     state.judgedCards = result.judgedCards;
@@ -1630,17 +4490,17 @@
       #${CONFIG.domSeatStripId} {
         position: fixed;
         z-index: 99998;
-        height: 22px;
-        min-width: 86px;
+        height: 24px;
+        min-width: 96px;
         padding: 0 6px;
         box-sizing: border-box;
         background: rgba(43, 43, 43, 0.94);
         border: 1px solid #d8b45f;
         color: #f4d17b;
-        font-family: "Microsoft YaHei", "PingFang SC", sans-serif;
-        font-size: 13px;
+        font-family: "FZBW", sans-serif;
+        font-size: ${CONFIG.seatStripFontSize}px;
         font-weight: 700;
-        line-height: 20px;
+        line-height: 22px;
         text-align: center;
         pointer-events: none;
         text-shadow: 0 1px 2px #000;
@@ -1697,6 +4557,35 @@
     });
   }
 
+  function drawRoundRect(graphics, width, height, radius, fillStyle) {
+    if (!graphics) return false;
+    const safeWidth = Math.max(0, Number(width) || 0);
+    const safeHeight = Math.max(0, Number(height) || 0);
+    const safeRadius = Math.max(0, Math.min(Number(radius) || 0, Math.min(safeWidth, safeHeight) / 2));
+    if (!safeRadius || typeof graphics.drawPath !== 'function') {
+      graphics.drawRect?.(0, 0, safeWidth, safeHeight, fillStyle);
+      return true;
+    }
+    try {
+      graphics.drawPath(0, 0, [
+        ['moveTo', safeRadius, 0],
+        ['lineTo', safeWidth - safeRadius, 0],
+        ['arcTo', safeWidth, 0, safeWidth, safeRadius, safeRadius],
+        ['lineTo', safeWidth, safeHeight - safeRadius],
+        ['arcTo', safeWidth, safeHeight, safeWidth - safeRadius, safeHeight, safeRadius],
+        ['lineTo', safeRadius, safeHeight],
+        ['arcTo', 0, safeHeight, 0, safeHeight - safeRadius, safeRadius],
+        ['lineTo', 0, safeRadius],
+        ['arcTo', 0, 0, safeRadius, 0, safeRadius],
+        ['closePath'],
+      ], { fillStyle });
+      return true;
+    } catch {
+      graphics.drawRect?.(0, 0, safeWidth, safeHeight, fillStyle);
+      return true;
+    }
+  }
+
   function createLayaCardBadgeSprite(cardWidth = 72) {
     const Laya = window.Laya;
     if (!Laya || !Laya.Sprite || !Laya.Text) return null;
@@ -1712,14 +4601,10 @@
       badge.pos(5, 4);
       badge.alpha = 0.98;
       badge.mouseEnabled = false;
-      if (window.__JND && window.__JND._box && typeof window.__JND._box.drawRoundRect === 'function') {
-        window.__JND._box.drawRoundRect(badge.graphics, labelWidth, labelHeight, 4, 'rgba(43,33,25,0.9)');
-      } else {
-        badge.graphics.drawRect(0, 0, labelWidth, labelHeight, 'rgba(43,33,25,0.9)', '#ffcf66', 1);
-      }
+      drawRoundRect(badge.graphics, labelWidth, labelHeight, 4, 'rgba(43,33,25,0.9)');
       const label = new Laya.Text();
       label.text = '不可对敌';
-      label.font = 'FZBW';
+      label.font = CONFIG.hintFontName;
       label.fontSize = fontSize;
       label.bold = true;
       label.color = '#ffe28a';
@@ -1885,6 +4770,10 @@
 
   function clearSeatStrip() {
     try {
+      window.SGS91Assistant?.getService?.('seatOverlay')?.clear?.(CONFIG.seatStripKey);
+    } catch {
+    }
+    try {
       if (window.__JND && typeof window.__JND.clearSeatSkillStrip === 'function') {
         window.__JND.clearSeatSkillStrip(CONFIG.seatStripKey);
       }
@@ -1896,6 +4785,30 @@
     if (dom) dom.remove();
   }
 
+  function renderSharedSeatStrip(text) {
+    const selfSeat = state.selfSeat;
+    const overlay = window.SGS91Assistant?.getService?.('seatOverlay');
+    if (!overlay?.show || !isRealSeat(selfSeat)) return false;
+    try {
+      const ok = overlay.show(CONFIG.seatStripKey, selfSeat, text, {
+        font: CONFIG.hintFontName,
+        fontSize: CONFIG.seatStripFontSize,
+        minFontSize: 10,
+        fitText: true,
+        textPaddingX: 4,
+        color: state.canUseJuxi ? '#a9f0af' : '#f4d17b',
+        zOrder: 99999,
+      });
+      if (ok) {
+        clearLayaSeatStrip();
+        document.getElementById(CONFIG.domSeatStripId)?.remove();
+        return true;
+      }
+    } catch {
+    }
+    return false;
+  }
+
   function renderJndSeatStrip(text) {
     const selfSeat = state.selfSeat;
     const jnd = window.__JND;
@@ -1903,7 +4816,8 @@
     try {
       if (lastJndStripText && lastJndStripText !== text) jnd.clearSeatSkillStrip(CONFIG.seatStripKey);
       const ok = jnd.showSeatSkillStrip(CONFIG.seatStripKey, selfSeat, text, {
-        fontSize: 13,
+        font: CONFIG.hintFontName,
+        fontSize: CONFIG.seatStripFontSize,
         minFontSize: 10,
         fitText: true,
         textPaddingX: 4,
@@ -1930,8 +4844,8 @@
     if (!Laya || !Laya.Sprite || !Laya.Text || !Laya.Point || !avatar || !comboLayer || typeof comboLayer.globalToLocal !== 'function') return false;
     clearLayaSeatStrip();
     try {
-      const width = state.canUseJuxi ? 96 : 78;
-      const height = 22;
+      const width = state.canUseJuxi ? 108 : 88;
+      const height = 24;
       const center = avatar.localToGlobal(new Laya.Point((avatar.width || 0) / 2, (avatar.height || 0) / 2), true);
       const local = comboLayer.globalToLocal(new Laya.Point(center.x, center.y), true);
       const strip = new Laya.Sprite();
@@ -1943,8 +4857,8 @@
       strip.graphics.drawRect(0, 0, width, height, '#2b2b2b', state.canUseJuxi ? '#75b979' : '#d8b45f', 1);
       const label = new Laya.Text();
       label.text = text;
-      label.font = 'FZBW';
-      label.fontSize = 13;
+      label.font = CONFIG.hintFontName;
+      label.fontSize = CONFIG.seatStripFontSize;
       label.bold = true;
       label.color = state.canUseJuxi ? '#a9f0af' : '#f4d17b';
       label.align = 'center';
@@ -1986,6 +4900,7 @@
     }
     const xText = formatStripNumber(state.unavailableCount);
     const text = `骤袭 X＝${xText}${state.canUseJuxi ? ' 可用' : ''}`;
+    if (renderSharedSeatStrip(text)) return;
     if (renderJndSeatStrip(text)) return;
     if (renderLayaSeatStrip(text)) return;
     renderDomSeatStrip(text);
@@ -1993,12 +4908,28 @@
 
   function renderInvalidJuxiMarks() {
     const jnd = window.__JND;
+    const overlay = window.SGS91Assistant?.getService?.('seatOverlay');
     Object.keys(state.juxiInvalidMarks).forEach((key) => {
       const mark = state.juxiInvalidMarks[key];
       const seat = toNumber(key, null);
       if (!mark || !isRealSeat(seat)) {
         clearJuxiInvalid(seat);
         return;
+      }
+      if (overlay?.show) {
+        try {
+          overlay.show(`${CONFIG.invalidStripPrefix}${seat}`, seat, '骤袭已失效', {
+            font: CONFIG.hintFontName,
+            fontSize: CONFIG.seatStripFontSize,
+            minFontSize: 10,
+            fitText: true,
+            textPaddingX: 4,
+            color: '#ffb1a1',
+            zOrder: 99999,
+          });
+          return;
+        } catch {
+        }
       }
       if (!jnd || typeof jnd.showSeatSkillStrip !== 'function') return;
       try {
@@ -2098,6 +5029,7 @@
         slashRemainingThisTurn: state.slashRemainingThisTurn,
         slashLimit: state.slashLimit,
         slashCounterSource: state.slashCounterSource,
+        hasZhugeCrossbowEquipped: state.hasZhugeCrossbowEquipped,
         slashUsageBySeat: cloneDiagnostic(state.slashUsageBySeat),
         attackRange: state.attackRange,
         selfIsMouDengAi: state.selfIsMouDengAi,
@@ -2162,6 +5094,16 @@
     setTimeout(() => clearInterval(timer), 180000);
   }
 
+  function hookInternalMessageBus() {
+    const getService = window.SGS91Assistant?.getService;
+    if (typeof getService !== 'function') return false;
+    const messages = getService.call(window.SGS91Assistant, 'gameMessages');
+    if (!messages || typeof messages.subscribe !== 'function' || state.hookStatus.internalMessagesHooked) return false;
+    messages.subscribe((type, payload) => onMessage(type, payload || {}));
+    state.hookStatus.internalMessagesHooked = true;
+    return true;
+  }
+
   function injectPageBridge() {
     if (document.getElementById('mda-juxi-page-bridge')) return;
     const script = document.createElement('script');
@@ -2193,7 +5135,9 @@
           currentTurnSeat: state.currentTurnSeat,
           isOwnPlayPhase: state.isOwnPlayPhase,
           slashUsedThisTurn: state.slashUsedThisTurn,
+          slashRemainingThisTurn: state.slashRemainingThisTurn,
           slashLimit: state.slashLimit,
+          hasZhugeCrossbowEquipped: state.hasZhugeCrossbowEquipped,
           attackRange: state.attackRange,
           selfIsMouDengAi: state.selfIsMouDengAi,
           characterEvidence: state.characterEvidence,
@@ -2238,6 +5182,7 @@
       renderAll();
     },
     onMessage,
+    __test: Object.freeze({ drawRoundRect }),
   };
 
   window.SGS91Assistant.registerModule({
@@ -2253,13 +5198,513 @@
   });
 
   injectPageBridge();
+  hookInternalMessageBus();
   hookJndBus();
   bootWhenReady();
+})();
+
+// ---- src/heroes/zhang-yu-xiangchen.user.js ----
+(function () {
+  'use strict';
+
+  const app = window.SGS91Assistant;
+  if (!app) throw new Error('SGS91 core must load before Zhang Yu Xiangchen module.');
+  if (app.getModule('hero.zhang-yu.xiangchen')) return;
+
+  const CONFIG = {
+    version: '1.0.0',
+    characterId: 1912,
+    skillId: 3800,
+    skillNames: ['相谶'],
+    stripKeyPrefix: 'sgs91-zhang-yu-xiangchen-',
+    stripColor: '#f4d17b',
+    hookRetryMs: 500,
+    hookMaxAttempts: 360,
+    refreshDebounceMs: 40,
+  };
+  const RESET_MESSAGE = /(?:MsgDealCharacters|MsgGameStart|MsgStartGame|MsgGameOver|MsgGameEnd|MsgLeaveGame)$/i;
+  const BOARD_MESSAGE = /(?:Turn|PlayerDead|DealCharacters|GameStart|GameOver|GameEnd|Seat)/i;
+  const CONFIRMED_XIANGCHEN_MESSAGE = /(?:MsgRoleOptNtf$|(?:Use|Cast|Play).*(?:Skill|Spell)|(?:Skill|Spell).*(?:Effect|Result|Finish|Done)|Opt.*(?:Result|Finish|Done))/i;
+  const FORBIDDEN_TARGET_PROMPT = /(?:MsgRoleOptTargetNtf$|(?:Target|Choose|Select).*(?:Prompt|Candidates?|List|Req|Ntf)$)/i;
+
+  function toNumber(value, fallback = null) {
+    if (value === '' || value == null) return fallback;
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  }
+
+  function isRealSeat(value) {
+    const seat = toNumber(value, null);
+    return seat != null && seat >= 0 && seat < 12;
+  }
+
+  function payloadSkillId(payload) {
+    return toNumber(payload && (
+      payload.spellId ?? payload.skillId ?? payload.SpellId ?? payload.SkillId
+      ?? payload.spell?.id ?? payload.skill?.id
+    ), null);
+  }
+
+  function payloadSkillName(payload) {
+    return String(payload && (
+      payload.skillName ?? payload.spellName ?? payload.SkillName ?? payload.SpellName
+      ?? payload.skill?.name ?? payload.spell?.name ?? payload.name ?? payload.Name
+    ) || '');
+  }
+
+  function payloadCasterSeat(payload) {
+    return toNumber(payload && (
+      payload.spellCasterSeat ?? payload.casterSeat ?? payload.srcSeat ?? payload.userSeat
+      ?? payload.ownerSeat ?? payload.optSeat ?? payload.fromSeat ?? payload.seat
+    ), null);
+  }
+
+  function extractSeatList(value) {
+    if (!Array.isArray(value)) return [];
+    return value.map((item) => toNumber(
+      item && typeof item === 'object' ? (item.seat ?? item.seatId ?? item.SeatId ?? item.targetSeat) : item,
+      null,
+    )).filter(isRealSeat);
+  }
+
+  function confirmedTargetSeat(type, payload) {
+    if (!payload || typeof payload !== 'object') return null;
+    const directKeys = ['selectedTargetSeat', 'chosenTargetSeat', 'dstSeat', 'destSeat', 'toSeat'];
+    if (/MsgRoleOptNtf$/i.test(String(type || ''))) directKeys.push('targetSeat', 'targetSeatID');
+    for (const key of directKeys) {
+      const seat = toNumber(payload[key], null);
+      if (isRealSeat(seat)) return seat;
+    }
+    for (const key of ['selectedTargets', 'chosenTargets', 'resultTargets', 'targets', 'target']) {
+      const seats = extractSeatList(Array.isArray(payload[key]) ? payload[key] : [payload[key]]);
+      if (seats.length === 1) return seats[0];
+    }
+    return null;
+  }
+
+  function payloadLooksLikeXiangchen(payload, model, config = CONFIG) {
+    if (!payload || typeof payload !== 'object') return false;
+    const id = payloadSkillId(payload);
+    const configuredId = toNumber(config.skillId, null);
+    const discoveredId = toNumber(model?.discoveredSkillId, null);
+    if (id != null && (id === configuredId || id === discoveredId)) return true;
+    const name = payloadSkillName(payload);
+    if (config.skillNames.some((item) => name.includes(item))) return true;
+    const cachedName = model?.skillNamesById?.[id];
+    return typeof cachedName === 'string' && config.skillNames.some((item) => cachedName.includes(item));
+  }
+
+  function extractConfirmedSelection(type, payload, model, config = CONFIG) {
+    const typeText = String(type || '');
+    if (!payload || typeof payload !== 'object') return null;
+    if (FORBIDDEN_TARGET_PROMPT.test(typeText)) return null;
+    if (!CONFIRMED_XIANGCHEN_MESSAGE.test(typeText)) return null;
+    if (!payloadLooksLikeXiangchen(payload, model, config)) return null;
+    const caster = payloadCasterSeat(payload);
+    const target = confirmedTargetSeat(typeText, payload);
+    if (!isRealSeat(caster) || !isRealSeat(target) || caster === target) return null;
+    return { caster, target, type: typeText, spellId: payloadSkillId(payload) };
+  }
+
+  function createModel() {
+    return {
+      deadSeats: [],
+      knownSeats: [],
+      skillNamesById: {},
+      discoveredSkillId: null,
+      targets: {},
+    };
+  }
+
+  function rememberSeat(model, value) {
+    const seat = toNumber(value, null);
+    if (!isRealSeat(seat) || model.knownSeats.includes(seat)) return false;
+    model.knownSeats.push(seat);
+    model.knownSeats.sort((left, right) => left - right);
+    return true;
+  }
+
+  function cacheSkillEvidence(model, payload, config = CONFIG) {
+    if (!payload || typeof payload !== 'object') return false;
+    let changed = false;
+    const queue = [{ value: payload, depth: 0 }];
+    const seen = new Set();
+    while (queue.length) {
+      const { value, depth } = queue.shift();
+      if (!value || typeof value !== 'object' || seen.has(value) || depth > 3) continue;
+      seen.add(value);
+      const id = payloadSkillId(value);
+      const name = payloadSkillName(value);
+      if (id != null && name) {
+        if (model.skillNamesById[id] !== name) {
+          model.skillNamesById[id] = name;
+          changed = true;
+        }
+        if (config.skillNames.some((item) => name.includes(item)) && model.discoveredSkillId !== id) {
+          model.discoveredSkillId = id;
+          changed = true;
+        }
+      }
+      Object.keys(value).slice(0, 50).forEach((key) => {
+        let nested;
+        try { nested = value[key]; } catch { return; }
+        if (nested && typeof nested === 'object') queue.push({ value: nested, depth: depth + 1 });
+      });
+    }
+    return changed;
+  }
+
+  function resetMatchModel(model) {
+    model.deadSeats = [];
+    model.knownSeats = [];
+    model.targets = {};
+  }
+
+  function reduceMessage(model, type, payload, config = CONFIG) {
+    const safePayload = payload || {};
+    const typeText = String(type || '');
+    let changed = false;
+    if (RESET_MESSAGE.test(typeText)) {
+      resetMatchModel(model);
+      changed = true;
+    }
+    if (/(?:Skill|Spell|RoleOpt|Character)/i.test(typeText)
+      || safePayload.spellId != null || safePayload.skillId != null
+      || safePayload.spellName != null || safePayload.skillName != null) {
+      if (cacheSkillEvidence(model, safePayload, config)) changed = true;
+    }
+    ['seat', 'srcSeat', 'ownerSeat', 'userSeat', 'optSeat', 'spellCasterSeat', 'targetSeat', 'targetSeatID'].forEach((key) => {
+      if (safePayload[key] !== undefined && rememberSeat(model, safePayload[key])) changed = true;
+    });
+    for (const key of ['targets', 'target', 'selectedTargets', 'chosenTargets']) {
+      extractSeatList(Array.isArray(safePayload[key]) ? safePayload[key] : [safePayload[key]]).forEach((seat) => {
+        if (rememberSeat(model, seat)) changed = true;
+      });
+    }
+    if (/MsgGamePlayerDead$/i.test(typeText)) {
+      const deadSeat = toNumber(safePayload.srcSeat ?? safePayload.seat ?? safePayload.userSeat, null);
+      if (isRealSeat(deadSeat) && !model.deadSeats.includes(deadSeat)) {
+        model.deadSeats.push(deadSeat);
+        model.deadSeats.sort((left, right) => left - right);
+        changed = true;
+      }
+      Object.keys(model.targets).forEach((casterKey) => {
+        if (Number(casterKey) === deadSeat || Number(model.targets[casterKey]) === deadSeat) {
+          delete model.targets[casterKey];
+          changed = true;
+        }
+      });
+    }
+    const selection = extractConfirmedSelection(typeText, safePayload, model, config);
+    if (selection && Number(model.targets[selection.caster]) !== selection.target) {
+      model.targets[selection.caster] = selection.target;
+      changed = true;
+    }
+    return { changed, selection };
+  }
+
+  function evaluateHints(targets, aliveSeats = []) {
+    const alive = new Set((Array.isArray(aliveSeats) ? aliveSeats : []).map(Number).filter(isRealSeat));
+    const hints = {};
+    Object.entries(targets || {}).forEach(([casterValue, targetValue]) => {
+      const caster = toNumber(casterValue, null);
+      const target = toNumber(targetValue, null);
+      if (!isRealSeat(caster) || !isRealSeat(target) || caster === target) return;
+      if (alive.size && (!alive.has(caster) || !alive.has(target))) return;
+      hints[String(target)] = { text: '相谶目标', color: CONFIG.stripColor };
+    });
+    return hints;
+  }
+
+  function createSeatStripRenderer(getOverlay = () => app.getService('seatOverlay')) {
+    const displayed = new Map();
+    const stats = { showCalls: 0, clearCalls: 0, skippedSameText: 0, lastError: '' };
+    const keyForSeat = (seat) => `${CONFIG.stripKeyPrefix}${seat}`;
+
+    function clearSeat(seat) {
+      if (!displayed.has(String(seat))) return;
+      const overlay = getOverlay();
+      if (overlay && typeof overlay.clear === 'function') {
+        try {
+          overlay.clear(keyForSeat(seat));
+          stats.clearCalls += 1;
+        } catch (error) {
+          stats.lastError = String(error?.message || error);
+        }
+      }
+      displayed.delete(String(seat));
+    }
+
+    function render(hints) {
+      const next = hints || {};
+      const allSeats = new Set([...displayed.keys(), ...Object.keys(next)]);
+      for (const seat of allSeats) {
+        const hint = next[seat];
+        const previous = displayed.get(String(seat));
+        if (!hint) {
+          clearSeat(seat);
+          continue;
+        }
+        if (previous && previous.text === hint.text && previous.color === hint.color) {
+          stats.skippedSameText += 1;
+          continue;
+        }
+        if (previous) clearSeat(seat);
+        const overlay = getOverlay();
+        if (!overlay || typeof overlay.show !== 'function' || typeof overlay.clear !== 'function') {
+          stats.lastError = '三国杀91助手座位文字服务不可用';
+          continue;
+        }
+        try {
+          const ok = overlay.show(keyForSeat(seat), Number(seat), hint.text, {
+            font: 'FZBW',
+            fontSize: 16,
+            minFontSize: 10,
+            fitText: true,
+            textPaddingX: 4,
+            color: hint.color,
+            zOrder: 99999,
+          });
+          stats.showCalls += 1;
+          if (ok !== false) displayed.set(String(seat), { text: hint.text, color: hint.color });
+        } catch (error) {
+          stats.lastError = String(error?.message || error);
+        }
+      }
+    }
+
+    function clearAll() {
+      Array.from(displayed.keys()).forEach(clearSeat);
+    }
+
+    return { render, clearAll, displayed, stats };
+  }
+
+  function findGameManager() {
+    return app.getService('seatOverlay')?.findGameManager?.() || null;
+  }
+
+  function seatObject(manager, seat) {
+    const fromService = app.getService('seatOverlay')?.readSeatObject?.(manager, seat);
+    if (fromService) return fromService;
+    const seats = manager?.Seats || manager?.seats;
+    if (!seats || !isRealSeat(seat)) return null;
+    try { return seats[seat] || seats.getNumberKey?.(seat) || null; }
+    catch { return null; }
+  }
+
+  function readDeadFlag(object) {
+    if (!object || typeof object !== 'object') return false;
+    return Boolean(object.dead ?? object.isDead ?? object.Dead ?? object.IsDead ?? false);
+  }
+
+  function readAliveSeats(model) {
+    const manager = findGameManager();
+    const seats = [];
+    const container = manager?.Seats || manager?.seats;
+    if (container) {
+      for (let seat = 0; seat < 12; seat += 1) {
+        const object = seatObject(manager, seat);
+        if (object && !(object.destroyed || object._destroyed) && !readDeadFlag(object)) seats.push(seat);
+      }
+    }
+    if (seats.length) return seats;
+    return model.knownSeats.filter((seat) => !model.deadSeats.includes(seat));
+  }
+
+  const model = createModel();
+  const renderer = createSeatStripRenderer();
+  const runtime = {
+    hints: {},
+    aliveSeats: [],
+    recentImportant: [],
+    lastRefreshReason: '',
+    refreshCount: 0,
+    refreshTimer: 0,
+    hookStatus: {
+      attached: false,
+      attempts: 0,
+      attachedAt: '',
+      lastMessageAt: '',
+      lastMessageType: '',
+      failure: '',
+    },
+  };
+
+  function refreshNow(reason = 'manual') {
+    runtime.aliveSeats = readAliveSeats(model);
+    runtime.hints = evaluateHints(model.targets, runtime.aliveSeats);
+    runtime.lastRefreshReason = reason;
+    runtime.refreshCount += 1;
+    renderer.render(runtime.hints);
+    return runtime.hints;
+  }
+
+  function scheduleRefresh(reason) {
+    if (runtime.refreshTimer) clearTimeout(runtime.refreshTimer);
+    runtime.refreshTimer = setTimeout(() => {
+      runtime.refreshTimer = 0;
+      refreshNow(reason);
+    }, CONFIG.refreshDebounceMs);
+  }
+
+  function cloneDiagnostic(value, depth = 0, seen = new Set()) {
+    if (depth > 4 || value == null) return value == null ? value : String(value);
+    if (typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
+    if (typeof value !== 'object') return String(value);
+    if (seen.has(value)) return '[Circular]';
+    seen.add(value);
+    if (Array.isArray(value)) return value.slice(0, 30).map((item) => cloneDiagnostic(item, depth + 1, seen));
+    const output = {};
+    Object.keys(value).slice(0, 80).forEach((key) => {
+      try { output[key] = cloneDiagnostic(value[key], depth + 1, seen); }
+      catch { output[key] = '[Unreadable]'; }
+    });
+    return output;
+  }
+
+  function onMessage(type, payload = {}) {
+    if (!type) return;
+    runtime.hookStatus.lastMessageAt = new Date().toISOString();
+    runtime.hookStatus.lastMessageType = String(type);
+    const result = reduceMessage(model, type, payload, CONFIG);
+    if (result.changed || BOARD_MESSAGE.test(String(type))) {
+      runtime.recentImportant.push({
+        at: runtime.hookStatus.lastMessageAt,
+        type: String(type),
+        selection: result.selection ? { ...result.selection } : null,
+      });
+      if (runtime.recentImportant.length > 80) runtime.recentImportant.shift();
+      scheduleRefresh(`message:${type}`);
+    }
+  }
+
+  function createDiagnostic() {
+    refreshNow('diagnostic');
+    return {
+      module: 'hero.zhang-yu.xiangchen',
+      version: CONFIG.version,
+      exportedAt: new Date().toISOString(),
+      url: location.href,
+      config: {
+        characterId: CONFIG.characterId,
+        skillId: CONFIG.skillId,
+        discoveredSkillId: model.discoveredSkillId,
+        skillNames: CONFIG.skillNames.slice(),
+      },
+      hookStatus: { ...runtime.hookStatus },
+      state: cloneDiagnostic(model),
+      aliveSeats: runtime.aliveSeats.slice(),
+      hints: cloneDiagnostic(runtime.hints),
+      renderStats: cloneDiagnostic(renderer.stats),
+      lastRefreshReason: runtime.lastRefreshReason,
+      refreshCount: runtime.refreshCount,
+      recentImportant: runtime.recentImportant.slice(-80),
+    };
+  }
+
+  async function copyDiagnostic() {
+    const text = JSON.stringify(createDiagnostic(), null, 2);
+    if (navigator.clipboard?.writeText) {
+      try {
+        await navigator.clipboard.writeText(text);
+        return text;
+      } catch {
+      }
+    }
+    if (!document.body) return text;
+    const textarea = document.createElement('textarea');
+    textarea.value = text;
+    textarea.style.position = 'fixed';
+    textarea.style.left = '-9999px';
+    document.body.appendChild(textarea);
+    textarea.select();
+    document.execCommand?.('copy');
+    textarea.remove();
+    return text;
+  }
+
+  function clearMarks() {
+    model.targets = {};
+    runtime.hints = {};
+    renderer.clearAll();
+    return true;
+  }
+
+  function attachMessageBus() {
+    runtime.hookStatus.attempts += 1;
+    const messages = app.getService('gameMessages');
+    if (!messages || typeof messages.subscribe !== 'function') return false;
+    if (runtime.hookStatus.attached) return true;
+    try {
+      messages.subscribe((type, payload) => onMessage(type, payload || {}));
+      runtime.hookStatus.attached = true;
+      runtime.hookStatus.attachedAt = new Date().toISOString();
+      scheduleRefresh('hook-attached');
+      return true;
+    } catch (error) {
+      runtime.hookStatus.failure = String(error?.message || error);
+      return false;
+    }
+  }
+
+  const api = Object.freeze({
+    version: CONFIG.version,
+    probe: createDiagnostic,
+    exportDiagnostic: createDiagnostic,
+    copyDiagnostic,
+    clearMarks,
+    onMessage,
+    __test: Object.freeze({
+      evaluateHints,
+      createModel,
+      reduceMessage,
+      extractConfirmedSelection,
+      createSeatStripRenderer,
+    }),
+  });
+  window.ZhangYuXiangchenHelper = api;
+
+  app.registerModule({
+    id: 'hero.zhang-yu.xiangchen',
+    type: 'hero',
+    name: '张裕·相谶',
+    version: CONFIG.version,
+    description: '张裕确认发动相谶后，在最近一次选择的目标武将位置显示提示。',
+    capabilities: ['game-message-read', 'seat-overlay', 'diagnostic-export'],
+    characterIds: [CONFIG.characterId],
+    skillIds: [CONFIG.skillId],
+    api,
+  });
+
+  if (!attachMessageBus()) runtime.hookStatus.failure = '三国杀91助手内置消息服务不可用';
 })();
 
 // ---- src/features/suit-sorter.user.js ----
 (function() {
   'use strict';
+
+  const FLOATING_ENABLED_KEY = 'sgs91-floating-window-enabled';
+  const MENU_COMMAND_ID = 'sgs91-floating-window-toggle';
+  let floatingEnabled = readFloatingEnabled();
+  let floatingBall = null;
+  let floatingStyle = null;
+  let cleanupFloatingListeners = null;
+  let initTimer = null;
+  let menuCommandId = null;
+
+  function readFloatingEnabled() {
+    if (typeof GM_getValue === 'function') {
+      try { return GM_getValue(FLOATING_ENABLED_KEY, false) === true; } catch {}
+    }
+    return false;
+  }
+
+  function saveFloatingEnabled(enabled) {
+    if (typeof GM_setValue === 'function') {
+      try { GM_setValue(FLOATING_ENABLED_KEY, Boolean(enabled)); } catch {}
+    }
+  }
 
   function getCardContainer() {
     const gameScene = window.SGS91Assistant && window.SGS91Assistant.getService('gameScene');
@@ -2290,9 +5735,15 @@
   // 可拖拽悬浮球
   // =====================================================
   function createFloatingBall() {
-    if (document.getElementById('sgs91-suit-sorter')) return;
+    if (!floatingEnabled || !document.body || !document.head) return null;
+    const existing = document.getElementById('sgs91-suit-sorter');
+    if (existing) {
+      floatingBall = existing;
+      return existing;
+    }
 
     const style = document.createElement('style');
+    style.id = 'sgs91-suit-sorter-style';
     style.textContent = `
       #sgs91-suit-sorter {
         position: fixed;
@@ -2330,12 +5781,14 @@
       }
     `;
     document.head.appendChild(style);
+    floatingStyle = style;
 
     const ball = document.createElement('div');
     ball.id = 'sgs91-suit-sorter';
     ball.title = '三国杀91助手 · 按花色排序';
     ball.textContent = '91';
     document.body.appendChild(ball);
+    floatingBall = ball;
 
     // 拖拽状态
     let isDragging = false;
@@ -2379,49 +5832,128 @@
     document.addEventListener('touchend', onEnd);
 
     // 窗口大小变化时修正位置
-    window.addEventListener('resize', () => {
+    const onResize = () => {
       const l = ball.offsetLeft;
       const t = ball.offsetTop;
       if (l > window.innerWidth - 46) ball.style.left = (window.innerWidth - 56) + 'px';
       if (t > window.innerHeight - 46) ball.style.top = (window.innerHeight - 56) + 'px';
-    });
+    };
+    window.addEventListener('resize', onResize);
+
+    cleanupFloatingListeners = () => {
+      ball.removeEventListener('mousedown', onStart);
+      ball.removeEventListener('touchstart', onStart);
+      document.removeEventListener('mousemove', onMove);
+      document.removeEventListener('touchmove', onMove);
+      document.removeEventListener('mouseup', onEnd);
+      document.removeEventListener('touchend', onEnd);
+      window.removeEventListener('resize', onResize);
+    };
 
     console.log('[三国杀91助手] 花色排序已就绪');
     return ball;
+  }
+
+  function destroyFloatingBall() {
+    if (cleanupFloatingListeners) {
+      cleanupFloatingListeners();
+      cleanupFloatingListeners = null;
+    }
+    floatingBall?.remove();
+    floatingStyle?.remove();
+    document.getElementById('sgs91-suit-sorter')?.remove();
+    document.getElementById('sgs91-suit-sorter-style')?.remove();
+    floatingBall = null;
+    floatingStyle = null;
   }
 
   // =====================================================
   // 初始化
   // =====================================================
   function tryInit() {
-    if (window.Laya && window.Laya.stage) {
+    if (!floatingEnabled) {
+      destroyFloatingBall();
+      return true;
+    }
+    if (document.body && window.Laya && window.Laya.stage) {
       createFloatingBall();
       return true;
     }
     return false;
   }
 
+  function scheduleInit() {
+    if (!floatingEnabled || tryInit() || initTimer) return;
+    let tries = 0;
+    initTimer = setInterval(() => {
+      if (tryInit() || ++tries > 60) {
+        clearInterval(initTimer);
+        initTimer = null;
+      }
+    }, 500);
+  }
+
+  function refreshMenuCommand() {
+    if (typeof GM_registerMenuCommand !== 'function') return false;
+    if (menuCommandId != null && typeof GM_unregisterMenuCommand === 'function') {
+      try { GM_unregisterMenuCommand(menuCommandId); } catch {}
+    }
+    const label = floatingEnabled ? '✅ 关闭 91 悬浮窗' : '⭕ 开启 91 悬浮窗';
+    try {
+      menuCommandId = GM_registerMenuCommand(label, toggleFloatingBall, {
+        id: MENU_COMMAND_ID,
+        autoClose: false,
+      });
+      return true;
+    } catch {
+      menuCommandId = GM_registerMenuCommand(label, toggleFloatingBall);
+      return true;
+    }
+  }
+
+  function setFloatingBallEnabled(enabled) {
+    floatingEnabled = Boolean(enabled);
+    saveFloatingEnabled(floatingEnabled);
+    if (floatingEnabled) scheduleInit();
+    else {
+      if (initTimer) {
+        clearInterval(initTimer);
+        initTimer = null;
+      }
+      destroyFloatingBall();
+    }
+    refreshMenuCommand();
+    return floatingEnabled;
+  }
+
+  function toggleFloatingBall() {
+    return setFloatingBallEnabled(!floatingEnabled);
+  }
+
+  function isFloatingBallEnabled() {
+    return floatingEnabled;
+  }
+
   window.SGS91CardSorter = Object.freeze({
     sortBySuit,
     getCardContainer,
+    isFloatingBallEnabled,
+    setFloatingBallEnabled,
+    toggleFloatingBall,
   });
 
   window.SGS91Assistant.registerModule({
     id: 'feature.hand-suit-sorter',
     type: 'feature',
     name: '手牌花色排序',
-    version: '2.1.0',
-    description: '点击可拖拽的 91 按钮，按游戏内部花色编号整理手牌显示顺序。',
-    capabilities: ['hand-read', 'hand-display-sort'],
+    version: '3.0.0',
+    description: '通过油猴菜单开关默认关闭的 91 悬浮按钮，点击后按花色整理手牌显示顺序。',
+    capabilities: ['hand-read', 'hand-display-sort', 'persistent-preference'],
     api: window.SGS91CardSorter,
   });
 
-  if (!tryInit()) {
-    // 轮询等待 Laya 加载（最长等30秒）
-    let tries = 0;
-    const timer = setInterval(() => {
-      if (tryInit() || ++tries > 60) clearInterval(timer);
-    }, 500);
-  }
+  refreshMenuCommand();
+  if (floatingEnabled) scheduleInit();
 
 })();
+})(typeof unsafeWindow !== 'undefined' && unsafeWindow ? unsafeWindow : window);

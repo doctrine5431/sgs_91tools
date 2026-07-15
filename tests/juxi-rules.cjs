@@ -103,6 +103,18 @@ function hasRangeTarget(context) {
   });
 }
 
+function getSlashRemainingUses(context) {
+  if (context.hasZhugeCrossbowEquipped === true) return Infinity;
+  if (context.slashRemainingThisTurn != null && Number.isFinite(Number(context.slashRemainingThisTurn))) {
+    return Math.max(0, Number(context.slashRemainingThisTurn));
+  }
+  const limit = context.slashLimit != null && context.slashLimit !== '' && Number.isFinite(Number(context.slashLimit))
+    ? Math.max(0, Number(context.slashLimit))
+    : 1;
+  const used = Number.isFinite(Number(context.slashUsedThisTurn)) ? Math.max(0, Number(context.slashUsedThisTurn)) : 0;
+  return Math.max(0, limit - used);
+}
+
 function hasDistanceOneTarget(context) {
   return computeDistanceToOthers(context).some((seat) => {
     if (seat.targetKnown) return seat.targetable;
@@ -117,9 +129,6 @@ function hasOtherWeaponTarget(context) {
 function judgeCardTargetability(card, context) {
   const name = normalizeCardName(card && card.name);
   const phase = context.currentPhase || '';
-  const slashUsed = Number(context.slashUsedThisTurn || 0);
-  const rawSlashLimit = context.slashLimit == null ? 1 : Number(context.slashLimit);
-  const slashLimit = Number.isFinite(rawSlashLimit) ? Math.max(0, rawSlashLimit) : Infinity;
 
   if (!name) {
     return {
@@ -165,24 +174,14 @@ function judgeCardTargetability(card, context) {
         confidence: 'medium',
       };
     }
-    if (slashLimit <= 0) {
+    if (getSlashRemainingUses(context) <= 0) {
       return {
         ...card,
         name,
         canTargetOther: false,
         countsAsUnavailable: true,
-        reason: '本回合被限制为不能使用【杀】（0/0）',
+        reason: '本回合普通【杀】使用次数已用完',
         confidence: 'high',
-      };
-    }
-    if (slashUsed >= slashLimit) {
-      return {
-        ...card,
-        name,
-        canTargetOther: false,
-        countsAsUnavailable: true,
-        reason: `本回合【杀】次数已用完（${slashUsed}/${slashLimit}）`,
-        confidence: 'medium',
       };
     }
     if (!hasRangeTarget(context)) {
@@ -200,8 +199,10 @@ function judgeCardTargetability(card, context) {
       name,
       canTargetOther: true,
       countsAsUnavailable: false,
-      reason: '【杀】次数未用完且范围内有目标',
-      confidence: 'medium',
+      reason: context.hasZhugeCrossbowEquipped === true
+        ? '已装备【诸葛连弩】，且范围内有目标'
+        : '本回合仍可使用普通【杀】，且范围内有目标',
+      confidence: 'high',
     };
   }
 
