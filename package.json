@@ -1,0 +1,11 @@
+{
+  "name": "sgs91-assistant",
+  "version": "0.2.0",
+  "private": true,
+  "description": "三国杀一将成名多武将只读对局助手",
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "test": "node tests/juxi-rules.test.cjs && node tests/juxi-invalid-tracking.test.cjs && node tests/core-registry.test.cjs && node tests/release.test.cjs",
+    "verify": "npm run build && node --check dist/三国杀91助手.user.js && npm test"
+  }
+}
